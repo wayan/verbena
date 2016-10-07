@@ -3,13 +3,22 @@ use lib qw(./lib);
 use List::Util qw(reduce);
 
 use Verbena
-    qw(loc_nested svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve loc_set loc_first loc_lazy svc_defer);
+    qw(svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve loc_first loc_lazy svc_defer container constructor);
 
 my $ii = 0;
 
-my $locator = loc_nested(
-    {   incr  => svc_singleton( sub { ++$ii } ),
-        inc   => sub            { ++$ii },
+package My::Class {
+    use Moose;
+
+    sub BUILDARGS {
+        my ( $class, $n ) = @_;
+        return { n => $n };
+    }
+}
+
+my $locator = container(
+    {   incr  => svc_singleton( 'inc' ),
+        inc   => sub                { ++$ii },
         sumba => svc_pos_deps(
             [ 'inc', 'inc', 'inc', 'inc' ],
             sub {
@@ -25,6 +34,10 @@ my $locator = loc_nested(
                 return $dsn . $dst;
             }
         ),
+        myc => svc_pos_deps(
+            [ svc_value('100') ],
+            constructor('My::Class'),
+        ),
         xyz  => svc_alias('yz'),
         yz   => svc_alias('xyz'),
         biak => svc_defer(
@@ -37,35 +50,44 @@ my $locator = loc_nested(
             )
         ),
     },
-    { Database => loc_nested( { dsn => svc_alias('../sumba'), }, {} ) }
+    { Database => container( { dsn => svc_alias('../sumba'), } ) }
 );
 
 use Data::Dump qw(pp);
 pp($locator);
 
 my $biak = resolve( $locator, 'biak' );
+warn resolve( $locator, 'inc');
+warn resolve( $locator, 'inc');
+warn resolve( $locator, 'inc');
+warn resolve( $locator, 'incr');
+warn resolve( $locator, 'incr');
+warn resolve( $locator, 'incr');
+
 warn "B $biak";
 warn $biak->();
 warn $biak->();
 warn $biak->();
 
 warn resolve( $locator, 'Database/dsn' );
-warn resolve(
-    loc_first( loc_set( { sumba => svc_value(245), } ), $locator ),
-    'Database/dsn',
-);
+warn resolve( loc_first( container( { sumba => svc_value(245), } ), $locator ),
+    'Database/dsn', );
 my $koko = loc_first(
-    loc_set( { sumba => svc_value(245), } ),
+    container( { sumba => svc_value(245), } ),
     $locator,
     loc_lazy(
         sub {
-            loc_set( { sumbawa => svc_alias('sumba'), } );
+            container( { sumbawa => svc_alias('sumba'), } );
         }
     ),
 );
 pp($koko);
+pp(+{map { $_=>$koko->fetch($_) } $koko->services});
+__END__
 warn $_ for $koko->services;
 warn $_ for $koko->services;
+
+warn resolve( $koko, 'myc' );
 
 # warn Verbena::resolve( $locator, 'xyz',);
 

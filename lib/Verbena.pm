@@ -6,7 +6,7 @@ use common::sense;
 
 use List::Util qw(reduce pairmap first);
 use Ref::Util qw(is_coderef);
-use Types::Standard qw(HasMethods CodeRef Str ArrayRef HashRef slurpy);
+use Types::Standard qw(HasMethods CodeRef Str ArrayRef HashRef Optional slurpy);
 use Type::Params ();
 
 use Exporter 'import';
@@ -19,37 +19,38 @@ our @EXPORT_OK = qw(
     svc_named_deps
     svc_singleton
     svc_defer
-    loc_nested
-    loc_set
     loc_first
     loc_lazy
+    container
+    constructor
+    sub_containers
 );
 
-my $ServiceLocatorType = HasMethods ['fetch'];
-my $ServiceType        = CodeRef;
-my $TargetType         = Str | $ServiceType;
+my $ContainerType = HasMethods ['fetch'];
+my $ServiceType   = CodeRef;
+my $TargetType    = Str | $ServiceType;
 
 sub resolve {
-    my ( $service_locator, $path ) = @_;
+    my ( $container, $path ) = @_;
 
     # passing opaque context
-    return _resolve( $service_locator, [], $path );
+    return _resolve( $container, [], $path );
 }
 
 sub _resolve {
-    my ( $service_locator, $paths, $path ) = @_;
+    my ( $container, $paths, $path ) = @_;
 
     if ( @$paths > 10 ) {
         die "Going too deep with deps: ", join( '=> ', map {"'$_'"} @$paths );
     }
 
-    my $service = $service_locator->fetch($path)
+    my $service = $container->fetch($path)
         or die "No service '$path'";
 
     my @new_paths = ( @$paths, $path );
     my $resolver = sub {
         my ($path) = @_;
-        return _resolve( $service_locator, \@new_paths, $path );
+        return _resolve( $container, \@new_paths, $path );
     };
     return $service->( $resolver, $path );
 }
@@ -58,14 +59,14 @@ sub svc_alias {
     state $params_check = Type::Params::compile(Str);
 
     my ($target) = $params_check->(@_);
-    return _target_resolver(svc_alias => $target);
+    return _target_resolver($target);
 }
 
 sub svc_defer {
     state $params_check = Type::Params::compile($TargetType);
 
     my ($target) = $params_check->(@_);
-    my $resolver = _target_resolver(svc_alias => $target);
+    my $resolver = _target_resolver($target);
     return sub {
         my @args = @_;
         sub { $resolver->(@args) };
@@ -80,7 +81,7 @@ sub svc_pos_deps {
     my $i         = 0;
     my @resolvers = map {
         my $idx = $i++;
-        _target_resolver( $idx, $_ )
+        _target_resolver( $_, "#$idx" )
     } @$deps;
 
     return sub {
@@ -94,7 +95,7 @@ sub svc_named_deps {
         = Type::Params::compile( HashRef [$TargetType], CodeRef );
     my ( $deps, $block ) = $params_check->(@_);
 
-    my @resolvers = pairmap { ($a => _target_resolver( $a, $b )); } %$deps;
+    my @resolvers = pairmap { ($a => _target_resolver( $b, "#$a" )); } %$deps;
 
     return sub {
         my @args = @_;
@@ -108,7 +109,7 @@ sub svc_value {
 }
 
 sub _target_resolver {
-    my ($dep_name, $target) = @_;
+    my ($target, $dep_name) = @_;
 
     if ( !ref $target ) {
         return sub {
@@ -117,22 +118,24 @@ sub _target_resolver {
         }
     }
     elsif ( is_coderef($target) ) {
+        my $suffix = $dep_name // '';
         return sub {
             my ($resolver, $base) = @_;
-            return $target->( $resolver, "$base#$dep_name" );
+            return $target->( $resolver, "$base$suffix" );
         };
     }
     die "Invalid type of dependency";
 }
 
 sub svc_singleton {
-    my ($code) = @_;
+    my ($target) = @_;
 
+    my $resolver = _target_resolver($target);
     my ( $resolved, $value );
     return sub {
         if ( !$resolved ) {
             $resolved = 1;
-            $value    = $code->(@_);
+            $value    = $resolver->(@_);
         }
         return $value;
     };
@@ -160,62 +163,48 @@ sub _join_path {
         : join( '', $start, ( $start ne '' ? '/' : '' ), $part );
 }
 
-sub loc_nested {
-    state $params_check = Type::Params::compile( HashRef [$ServiceType],
-        HashRef [$ServiceLocatorType] );
-    my ( $services, $locators ) = $params_check->(@_);
+# container created with sub_containers
+sub sub_containers {
+    state $params_check
+        = Type::Params::compile( Optional [ HashRef [$ContainerType] ] );
 
-    return bless(
-        {   services => $services,
-            locators => $locators,
-        },
-        'Verbena::ServiceLocator::Nested'
-    );
+    my ($sub_containers) = $params_check->(@_);
+    return bless( { sub_containers => $sub_containers },
+        'Verbena::Container::SubContainers' );
 }
 
 {
-
-    package Verbena::ServiceLocator::Nested;
-
+    package Verbena::Container::SubContainers;
     use List::Util qw(pairmap);
 
     sub fetch {
         my ( $this, $path ) = @_;
 
         my @parts = split m{\/}, $path, 2;
-        return @parts == 1
-            ? $this->{services}{ $parts[0] }
-            : do {
-            my $inner = $this->{locators}{ $parts[0] };
-            $inner ? $inner->fetch( $parts[1] ) : undef;
-            };
+        if (@parts == 2){
+            if (my $sub_container = $this->{sub_containers}{ $parts[0] }){
+                return $sub_container->fetch($parts[1]);
+            }
+        }
+        return undef;
     }
 
     sub services {
         my ($this) = @_;
 
-        return keys %{ $this->{services} }, pairmap {
+        return pairmap {
             my $prefix = $a;
             map { "$prefix/$_"; } $b->services;
         }
-        %{ $this->{locators} };
+        %{ $this->{sub_containers} };
     }
 }
 
-sub loc_set {
-    state $params_check = Type::Params::compile( HashRef [$ServiceType] );
-
-    my ( $services, $locators ) = $params_check->(@_);
-    return bless( { services => $services, }, 'Verbena::ServiceLocator::Set' );
-}
-
 {
-
-    package Verbena::ServiceLocator::Set;
+    package Verbena::Container::Services;
 
     sub fetch {
         my ( $this, $path ) = @_;
-
         return $this->{services}{$path};
     }
 
@@ -225,16 +214,36 @@ sub loc_set {
     }
 }
 
+sub container {
+    state $params_check = Type::Params::compile( HashRef [$ServiceType],
+        Optional [ HashRef [$ContainerType] ] );
+
+    my ( $services, $sub_containers ) = @_;
+
+    my $container
+        = bless( { services => $services, }, 'Verbena::Container::Services' );
+    return $sub_containers
+        ? loc_first(
+        $container,
+        bless(
+            { sub_containers => $sub_containers, },
+            'Verbena::Container::SubContainers'
+        ),
+        )
+        : $container;
+}
+
+
 sub loc_first {
     state $params_check
-        = Type::Params::compile( slurpy( ArrayRef [$ServiceLocatorType] ) );
+        = Type::Params::compile( slurpy( ArrayRef [$ContainerType] ) );
     my ($locators) = $params_check->(@_);
     return bless( { locators => $locators, },
-        'Verbena::ServiceLocator::FirstFrom' );
+        'Verbena::Container::FirstFrom' );
 }
 {
 
-    package Verbena::ServiceLocator::FirstFrom;
+    package Verbena::Container::FirstFrom;
 
     use List::MoreUtils qw(uniq);
 
@@ -255,32 +264,49 @@ sub loc_first {
     }
 }
 
+# lazy container - evaluated when first needed
 sub loc_lazy {
     state $params_check = Type::Params::compile(CodeRef);
     my ($builder) = $params_check->(@_);
-    return bless( { builder => $builder, }, 'Verbena::ServiceLocator::Lazy' );
+    return bless( { builder => $builder, }, 'Verbena::Container::Lazy' );
 }
 
 {
 
-    package Verbena::ServiceLocator::Lazy;
+    package Verbena::Container::Lazy;
 
-    sub _locator {
+    sub _container {
         my $this = shift;
-        return $this->{locator} //= $this->{builder}->();
+        return $this->{container} //= $this->{builder}->();
     }
 
     sub fetch {
         my ( $this, $path ) = @_;
 
-        return $this->_locator->fetch($path);
+        return $this->_container->fetch($path);
     }
 
     sub services {
         my ($this) = @_;
 
-        return $this->_locator->services;
+        return $this->_container->services;
     }
+}
+
+use Class::Load;
+sub constructor {
+    state $params_check = Type::Params::compile(Str, Optional[Str]);
+
+    my ($class, $method_arg) = $params_check->(@_);
+    my $method = $method_arg // 'new';
+
+    my $loaded;
+    return sub {
+        if (!$loaded){
+            Class::Load::load_class($class);
+        }
+        return $class->$method(@_);
+    };
 }
 
 1;
