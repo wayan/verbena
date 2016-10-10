@@ -1,11 +1,29 @@
 use common::sense;
 use lib qw(./lib);
 use List::Util qw(reduce);
+use Types::Standard qw(HashRef Str);
+use Carp qw(confess);
 
 use Verbena
-    qw(svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve loc_first loc_lazy svc_defer container constructor);
+    qw(svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve loc_first container_lazy svc_defer container constructor target_resolver);
 
 my $ii = 0;
+
+sub check_svc_type {
+    my ( $svc, $type ) = @_;
+
+	my $target = target_resolver($svc);
+    return sub {
+        my $resolved = $target->(@_);
+        if ( !$type->check($resolved) ) {
+            my ( $resolver, $path ) = @_;
+            confess sprintf "Service '%s' does not conform its type: %s",
+                $path,
+                $type->get_message($resolved);
+        }
+        return $resolved;
+    };
+}
 
 package My::Class {
     use Moose;
@@ -25,6 +43,9 @@ my $locator = container(
                 return reduce { $a + $b } 0, @_;
             }
         ),
+	circle => svc_alias('Circle/circle'),
+	hulman => svc_defer(svc_pos_deps( ['circle'], sub { shift() })),
+	makak => check_svc_type( 'inc', HashRef),
         dsn => svc_value('dbi:somewhere'),
         dst => svc_value('dbi:anywhere'),
         sum => svc_pos_deps(
@@ -49,13 +70,33 @@ my $locator = container(
                 }
             )
         ),
+	dbh => svc_alias('Database/dbh'),
     },
-    { Database => container( { dsn => svc_alias('../sumba'), } ) }
+    { 
+	Circle => container({
+		circle => svc_alias('../circle'),
+	}),
+	Database => container( { dsn => svc_alias('../xsumba'), 
+	dbh=> svc_pos_deps(
+		[
+			'dsn',
+		],
+		sub {
+		}
+	)
+	} ) }
 );
 
 use Data::Dump qw(pp);
 pp($locator);
 
+resolve( $locator, 'makak');
+my $hulman = resolve( $locator, 'hulman');
+$hulman->();
+__END__
+
+resolve( $locator, 'dbh' );
+__END__
 my $biak = resolve( $locator, 'biak' );
 warn resolve( $locator, 'inc');
 warn resolve( $locator, 'inc');
@@ -75,7 +116,7 @@ warn resolve( loc_first( container( { sumba => svc_value(245), } ), $locator ),
 my $koko = loc_first(
     container( { sumba => svc_value(245), } ),
     $locator,
-    loc_lazy(
+    container_lazy(
         sub {
             container( { sumbawa => svc_alias('sumba'), } );
         }
