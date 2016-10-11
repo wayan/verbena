@@ -10,18 +10,36 @@ use Verbena
 my $ii = 0;
 
 sub check_svc_type {
-    my ( $svc, $type ) = @_;
+    my ( $target, $type ) = @_;
 
-	my $target = target_resolver($svc);
+    my $svc = target_resolver($target);
     return sub {
-        my $resolved = $target->(@_);
+        my ($resolved, $new_state) = $svc->(@_);
         if ( !$type->check($resolved) ) {
-            my ( $resolver, $path ) = @_;
+            my ( $resolve, $container, $state, $path ) = @_;
             confess sprintf "Service '%s' does not conform its type: %s",
                 $path,
                 $type->get_message($resolved);
         }
-        return $resolved;
+        return ($resolved, $new_state);
+    };
+}
+
+package My::ContainerWithLogger {
+    use Moose;
+
+    has container =>
+        ( is => 'ro', required => 1, handles => [ 'fetch', 'services' ] );
+
+    around fetch => sub {
+        my $orig = shift;
+        my $svc  = $orig->(@_);
+        return sub {
+            my ( $resolve, $container, $state, $path ) = @_;
+            warn sprintf "Resolving route(%s)\n",
+		join('=>', map { "'$_'" } @{$state->{route}});
+            $svc->(@_);
+        };
     };
 }
 
@@ -45,7 +63,10 @@ my $locator = container(
         ),
 	circle => svc_alias('Circle/circle'),
 	hulman => svc_defer(svc_pos_deps( ['circle'], sub { shift() })),
-	makak => check_svc_type( 'inc', HashRef),
+	makak => check_svc_type( svc_pos_deps(['inc'], sub {
+		my $inc = shift;
+		{inc => $inc};
+	}), HashRef),
         dsn => svc_value('dbi:somewhere'),
         dst => svc_value('dbi:anywhere'),
         sum => svc_pos_deps(
@@ -90,14 +111,18 @@ my $locator = container(
 use Data::Dump qw(pp);
 pp($locator);
 
-resolve( $locator, 'makak');
-my $hulman = resolve( $locator, 'hulman');
+my $locator2 = My::ContainerWithLogger->new(container => $locator);
+resolve( $locator2, 'makak');
+my $biak = resolve( $locator2, 'biak' );
+warn $biak->();
+warn $biak->();
+warn $biak->();
+my $hulman = resolve( $locator2, 'hulman');
 $hulman->();
 __END__
 
 resolve( $locator, 'dbh' );
 __END__
-my $biak = resolve( $locator, 'biak' );
 warn resolve( $locator, 'inc');
 warn resolve( $locator, 'inc');
 warn resolve( $locator, 'inc');
@@ -106,7 +131,6 @@ warn resolve( $locator, 'incr');
 warn resolve( $locator, 'incr');
 
 warn "B $biak";
-warn $biak->();
 warn $biak->();
 warn $biak->();
 
