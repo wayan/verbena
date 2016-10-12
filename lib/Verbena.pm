@@ -20,9 +20,10 @@ our @EXPORT_OK = qw(
     svc_value
     svc_pos_deps
     svc_named_deps
-    svc_singleton
+    svc_singleton   
+    svc_singleton2
     svc_defer
-    loc_first
+    merge_containers
     container_lazy
     container
     constructor
@@ -30,9 +31,10 @@ our @EXPORT_OK = qw(
     target_resolver
 );
 
-my $ContainerType = HasMethods ['fetch'];
+my $ContainerType = HasMethods ['get_service'];
 my $ServiceType   = CodeRef;
 my $TargetType    = Str | $ServiceType;
+my $default_max_depth = 20;
 
 sub resolve {
     my ( $container, $path, $state_in ) = @_;
@@ -44,18 +46,20 @@ sub resolve {
     return wantarray ? ( $resolved, $state_out ) : $resolved;
 }
 
-my $max_depth = 12;
-
 sub _resolve {
     my ( $container, $state, $path ) = @_;
 
     my $route = $state->{route};
+    my $max_depth = $state->{max_depth} // $default_max_depth;
+
     if ( @$route > $max_depth ) {
-        die "Going too deep with deps: ", join( ' => ', map {"'$_'"} @$route );
+        die "Going too deep with deps: ",
+            join( ' => ', map {"'$_'"} @$route );
     }
 
-    my $service = $container->fetch($path)
-        or confess sprintf("No service '%s' (%s)", $path, join('=> ', map { "'$_'"} @$route, $path));
+    my $service = $container->get_service($path)
+        or confess sprintf( "No service '%s' (%s)",
+        $path, join( '=> ', map {"'$_'"} @$route, $path ) );
 
     my @new_route = ( @$route, $path );
     my ( $resolved, $state_out ) = $service->(
@@ -63,7 +67,7 @@ sub _resolve {
     );
 
     # route back
-    return ($resolved, {%$state_out, route => $route});
+    return ( $resolved, { %$state_out, route => $route } );
 }
 
 sub svc_alias {
@@ -89,18 +93,16 @@ sub svc_pos_deps {
         = Type::Params::compile( ArrayRef [$TargetType], CodeRef );
     my ( $deps, $block ) = $params_check->(@_);
 
-    my $i        = 0;
     my $svc_deps = merge_services(
         map {
-            my $idx = $i++;
-            target_resolver( $_, "#$idx" )
-        } @$deps
+            target_resolver( $deps->[$_], "#$_" )
+        } 0 .. (@$deps - 1)
     );
 
     # passing state
     return sub {
         my ( $dep_values, $new_state ) = $svc_deps->(@_);
-        return ( $block->(@$dep_values), $new_state );
+        return ( scalar( $block->(@$dep_values) ), $new_state );
     };
 }
 
@@ -116,8 +118,15 @@ sub svc_named_deps {
     return sub {
         my ( $dep_values, $new_state ) = $svc_deps->(@_);
 
-        return $block->( map { $dep_names[$_] => $dep_values->[$_] }
-                0 .. ( @dep_names - 1 ) );
+        return (
+            scalar(
+                $block->(
+                    map { $dep_names[$_] => $dep_values->[$_] }
+                        0 .. ( @dep_names - 1 )
+                )
+            ),
+            $new_state
+        );
     };
 }
 
@@ -179,6 +188,48 @@ sub svc_singleton {
     };
 }
 
+# immutable set state of nested key
+sub _set_state {
+    my ($data, $value, $key, @keys) = @_;
+    return {
+        %$data,
+        $key => (
+            @keys
+            ? _set_state( $data->{$key} // {}, $value, @keys )
+            : $value
+        )
+    };
+}
+
+# get the nested value from the state
+# returns ($value) - unempty list or ()
+sub _get_state {
+    my ( $data, $key, @keys ) = @_;
+    return
+        exists $data->{$key}
+        ? ( @keys ? _get_state( $data->{$key}, @keys ) : ( $data->{$key} ) )
+        : ();
+}
+
+sub svc_singleton2 {
+    my ($target, $key, $lifetime) = @_;
+
+    $key   //= join( ' at ', (caller(0))[1,2]);
+    $lifetime //= 'singleton';
+    my $svc = target_resolver($target);
+    return sub {
+        my ($resolve, $container, $state, $base) = @_;
+    
+        if ( my ($stored) = _get_state( $state, 'lifetime', $lifetime, $key ) ) {
+            return $stored;
+        }
+        # creating new state :-(
+        my ($resolved, $new_state) = $svc->($resolve, $container, $state, $base);
+        return ( $resolved, _set_state($new_state, $resolved, 'lifetime', $lifetime, $key));
+    };
+    
+}
+
 sub abs_path_to_service {
     my ( $target, $base ) = @_;
 
@@ -217,12 +268,12 @@ sub container {
     state $params_check = Type::Params::compile( HashRef [$ServiceType],
         Optional [ HashRef [$ContainerType] ] );
 
-    my ( $services, $sub_containers ) = @_;
+    my ( $services, $sub_containers ) = $params_check->(@_);
 
     my $container
         = bless( { services => $services, }, 'Verbena::Container::Services' );
     return $sub_containers
-        ? loc_first(
+        ? merge_containers(
         $container,
         bless(
             { sub_containers => $sub_containers, },
@@ -232,7 +283,7 @@ sub container {
         : $container;
 }
 
-sub loc_first {
+sub merge_containers {
     state $params_check
         = Type::Params::compile( slurpy( ArrayRef [$ContainerType] ) );
     my ($containers) = $params_check->(@_);
@@ -252,13 +303,13 @@ sub container_lazy {
     package Verbena::Container::SubContainers;
     use List::Util qw(pairmap);
 
-    sub fetch {
+    sub get_service {
         my ( $this, $path ) = @_;
 
         my @parts = split m{\/}, $path, 2;
         if ( @parts == 2 ) {
             if ( my $sub_container = $this->{sub_containers}{ $parts[0] } ) {
-                return $sub_container->fetch( $parts[1] );
+                return $sub_container->get_service( $parts[1] );
             }
         }
         return undef;
@@ -295,7 +346,7 @@ sub constructor {
 
     package Verbena::Container::Services;
 
-    sub fetch {
+    sub get_service {
         my ( $this, $path ) = @_;
         return $this->{services}{$path};
     }
@@ -312,11 +363,11 @@ sub constructor {
 
     use List::MoreUtils qw(uniq);
 
-    sub fetch {
+    sub get_service {
         my ( $this, $path ) = @_;
 
         for my $container ( @{ $this->{containers} } ) {
-            my $service = $container->fetch($path);
+            my $service = $container->get_service($path);
             return $service if $service;
         }
         return;
@@ -338,10 +389,10 @@ sub constructor {
         return $this->{container} //= $this->{builder}->();
     }
 
-    sub fetch {
+    sub get_service {
         my ( $this, $path ) = @_;
 
-        return $this->_container->fetch($path);
+        return $this->_container->get_service($path);
     }
 
     sub services {

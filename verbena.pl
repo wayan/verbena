@@ -1,11 +1,12 @@
 use common::sense;
+
 use lib qw(./lib);
 use List::Util qw(reduce);
 use Types::Standard qw(HashRef Str);
 use Carp qw(confess);
 
 use Verbena
-    qw(svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve loc_first container_lazy svc_defer container constructor target_resolver);
+    qw(svc_singleton svc_pos_deps svc_named_deps svc_value svc_alias resolve merge_containers container_lazy svc_defer container constructor target_resolver);
 
 my $ii = 0;
 
@@ -14,30 +15,33 @@ sub check_svc_type {
 
     my $svc = target_resolver($target);
     return sub {
-        my ($resolved, $new_state) = $svc->(@_);
+        my ( $resolved, $new_state ) = $svc->(@_);
         if ( !$type->check($resolved) ) {
             my ( $resolve, $container, $state, $path ) = @_;
             confess sprintf "Service '%s' does not conform its type: %s",
                 $path,
                 $type->get_message($resolved);
         }
-        return ($resolved, $new_state);
+        return ( $resolved, $new_state );
     };
 }
 
 package My::ContainerWithLogger {
     use Moose;
 
-    has container =>
-        ( is => 'ro', required => 1, handles => [ 'fetch', 'services' ] );
+    has container => (
+        is       => 'ro',
+        required => 1,
+        handles  => [ 'get_service', 'services' ]
+    );
 
-    around fetch => sub {
+    around get_service => sub {
         my $orig = shift;
         my $svc  = $orig->(@_);
         return sub {
             my ( $resolve, $container, $state, $path ) = @_;
             warn sprintf "Resolving route(%s)\n",
-		join('=>', map { "'$_'" } @{$state->{route}});
+                join( '=>', map {"'$_'"} @{ $state->{route} } );
             $svc->(@_);
         };
     };
@@ -52,21 +56,27 @@ package My::Class {
     }
 }
 
-my $locator = container(
-    {   incr  => svc_singleton( 'inc' ),
-        inc   => sub                { ++$ii },
+my $container = container(
+    {   incr  => Verbena::svc_singleton2('inc'),
+        inc   => sub { ++$ii },
         sumba => svc_pos_deps(
             [ 'inc', 'inc', 'inc', 'inc' ],
             sub {
                 return reduce { $a + $b } 0, @_;
             }
         ),
-	circle => svc_alias('Circle/circle'),
-	hulman => svc_defer(svc_pos_deps( ['circle'], sub { shift() })),
-	makak => check_svc_type( svc_pos_deps(['inc'], sub {
-		my $inc = shift;
-		{inc => $inc};
-	}), HashRef),
+        circle => svc_alias('Circle/circle'),
+        hulman => svc_defer( svc_pos_deps( ['circle'], sub { shift() } ) ),
+        makak  => check_svc_type(
+            svc_pos_deps(
+                ['inc'],
+                sub {
+                    my $inc = shift;
+                    { inc => $inc };
+                }
+            ),
+            HashRef
+        ),
         dsn => svc_value('dbi:somewhere'),
         dst => svc_value('dbi:anywhere'),
         sum => svc_pos_deps(
@@ -91,55 +101,58 @@ my $locator = container(
                 }
             )
         ),
-	dbh => svc_alias('Database/dbh'),
+        dbh => svc_alias('Database/dbh'),
     },
-    { 
-	Circle => container({
-		circle => svc_alias('../circle'),
-	}),
-	Database => container( { dsn => svc_alias('../xsumba'), 
-	dbh=> svc_pos_deps(
-		[
-			'dsn',
-		],
-		sub {
-		}
-	)
-	} ) }
+    {   Circle   => container( { circle => svc_alias('../circle'), } ),
+        Database => container(
+            {   dsn => svc_alias('../xsumba'),
+                dbh => svc_pos_deps(
+                    [ 'dsn', ],
+                    sub {
+                    }
+                )
+            }
+        )
+    }
 );
 
 use Data::Dump qw(pp);
-pp($locator);
+pp($container);
 
-my $locator2 = My::ContainerWithLogger->new(container => $locator);
-resolve( $locator2, 'makak');
-my $biak = resolve( $locator2, 'biak' );
+my $container2 = My::ContainerWithLogger->new( container => $container );
+my ( $resolved, $state ) = resolve( $container2, 'incr' );
+pp($state);
+resolve( $container2, 'makak' );
+
+__END__
+
+my $biak = resolve( $container2, 'biak' );
 warn $biak->();
 warn $biak->();
 warn $biak->();
-my $hulman = resolve( $locator2, 'hulman');
+my $hulman = resolve( $container2, 'hulman');
 $hulman->();
 __END__
 
-resolve( $locator, 'dbh' );
+resolve( $container, 'dbh' );
 __END__
-warn resolve( $locator, 'inc');
-warn resolve( $locator, 'inc');
-warn resolve( $locator, 'inc');
-warn resolve( $locator, 'incr');
-warn resolve( $locator, 'incr');
-warn resolve( $locator, 'incr');
+warn resolve( $container, 'inc');
+warn resolve( $container, 'inc');
+warn resolve( $container, 'inc');
+warn resolve( $container, 'incr');
+warn resolve( $container, 'incr');
+warn resolve( $container, 'incr');
 
 warn "B $biak";
 warn $biak->();
 warn $biak->();
 
-warn resolve( $locator, 'Database/dsn' );
-warn resolve( loc_first( container( { sumba => svc_value(245), } ), $locator ),
+warn resolve( $container, 'Database/dsn' );
+warn resolve( merge_containers( container( { sumba => svc_value(245), } ), $container ),
     'Database/dsn', );
-my $koko = loc_first(
+my $koko = merge_containers(
     container( { sumba => svc_value(245), } ),
-    $locator,
+    $container,
     container_lazy(
         sub {
             container( { sumbawa => svc_alias('sumba'), } );
@@ -147,12 +160,12 @@ my $koko = loc_first(
     ),
 );
 pp($koko);
-pp(+{map { $_=>$koko->fetch($_) } $koko->services});
+pp(+{map { $_=>$koko->get_service($_) } $koko->services});
 __END__
 warn $_ for $koko->services;
 warn $_ for $koko->services;
 
 warn resolve( $koko, 'myc' );
 
-# warn Verbena::resolve( $locator, 'xyz',);
+# warn Verbena::resolve( $container, 'xyz',);
 
