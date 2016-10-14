@@ -288,7 +288,7 @@ sub merge_containers {
         = Type::Params::compile( slurpy( ArrayRef [$ContainerType] ) );
     my ($containers) = $params_check->(@_);
     return
-        bless( { containers => $containers, }, 'Verbena::Container::FirstFrom' );
+        bless( { containers => $containers, }, 'Verbena::Container::Merged' );
 }
 
 # lazy container - evaluated when first needed
@@ -359,7 +359,7 @@ sub constructor {
 
 {
 
-    package Verbena::Container::FirstFrom;
+    package Verbena::Container::Merged;
 
     use List::MoreUtils qw(uniq);
 
