@@ -409,7 +409,7 @@ __END__
 
 =head2 Container
 
-Container is any object having method C<< get_service($path) >> which returns
+Container is an object with method C<< get_service($path) >> which returns
 a service for given path.
 
 All the containers returned by the functions from this library have also
@@ -436,8 +436,13 @@ The container which was passed to resolve.
 
 =item C<< $state >>
 
-The structure (opaque for most services) containing the state of resolving (
-).
+The structure (opaque for most services) containing the state of resolving ().
+
+=item C<< $path >>
+
+The path of currently resolved. It must be noted the path is passed, it is not
+part of the service. It means that the exactly the same service (the coderef)
+can be used for different paths in the container.
 
 =back
 
@@ -472,8 +477,8 @@ the stored service.
 
 =item B<< sub_container({ $name=>$container, $name=>$container, ... }) >>
 
-Returns a container - hierarchical lookup of services. The C<<
-get_service($path) >> method splits the path on first slash (C<< / >>), 
+Returns a container - hierarchical lookup of services. The 
+C<< get_service($path) >> method splits the path on first slash (C<< / >>), 
 gets container for the first part and ask it for a service passing the
 second part of the original path.
 
@@ -498,6 +503,14 @@ first time C<< get_service($path) >> is called.
 =item B<svc_value($any)>
 
 When resolved returns the value unchanged. 
+
+=item B<< svc_alias($path) >>
+
+When resolved returns the value of service addressed by the path.
+The path may be either absolute (starting with slash) or relative.
+When absolute the leading slash is removed and the path is used.
+When relative then the path is "absolutized" according to the 
+path of the service alias.
 
 =item B<svc_pos_deps([ $target, ...], \&block)>
 
