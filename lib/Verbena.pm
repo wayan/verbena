@@ -273,13 +273,7 @@ sub container {
     my $container
         = bless( { services => $services, }, 'Verbena::Container::Services' );
     return $sub_containers
-        ? merge_containers(
-        $container,
-        bless(
-            { sub_containers => $sub_containers, },
-            'Verbena::Container::SubContainers'
-        ),
-        )
+        ? merge_containers( $container, sub_containers($sub_containers) )
         : $container;
 }
 
@@ -298,9 +292,27 @@ sub container_lazy {
     return bless( { builder => $builder, }, 'Verbena::Container::Lazy' );
 }
 
+sub constructor {
+    state $params_check = Type::Params::compile( Str, Optional [Str] );
+
+    my ( $class, $method_arg ) = $params_check->(@_);
+    my $method = $method_arg // 'new';
+
+    my $loaded;
+    return sub {
+        if ( !$loaded ) {
+            Class::Load::load_class($class);
+        }
+        return $class->$method(@_);
+    };
+}
+
+
+# Simple classes for different types of containers
 {
 
     package Verbena::Container::SubContainers;
+
     use List::Util qw(pairmap);
 
     sub get_service {
@@ -324,21 +336,6 @@ sub container_lazy {
         }
         %{ $this->{sub_containers} };
     }
-}
-
-sub constructor {
-    state $params_check = Type::Params::compile( Str, Optional [Str] );
-
-    my ( $class, $method_arg ) = $params_check->(@_);
-    my $method = $method_arg // 'new';
-
-    my $loaded;
-    return sub {
-        if ( !$loaded ) {
-            Class::Load::load_class($class);
-        }
-        return $class->$method(@_);
-    };
 }
 
 # implementation of the containers
@@ -404,4 +401,128 @@ sub constructor {
 
 1;
 
+__END__
+
+=head1 SYNOPSIS
+
+=head1 DESCRIPTION
+
+=head2 Container
+
+Container is any object having method C<< get_service($path) >> which returns
+a service for given path.
+
+All the containers returned by the functions from this library have also
+method C<< services() >> which returns all available paths of the container.
+
+=head2 Service
+
+Service is an anonymous subroutine which returns a component of your
+application addressed by a path. The service is (so far) called as
+
+    $service->($resolve, $container, $state, $path)
+
+The parameters are:
+
+=over 4
+
+=item C<< $resolve >>
+
+The anonymous subroutine which can be used to resolve the dependencies of the service.
+
+=item C<< $container >>
+
+The container which was passed to resolve. 
+
+=item C<< $state >>
+
+The structure (opaque for most services) containing the state of resolving (
+).
+
+=back
+
+The service is supposed to return two values list C<< ($resolved, $new_state) >>
+
+
+=head1 FUNCTIONS
+
+=over 4 
+
+=item B<< resolve( $container, $path, [ $state ] ) >>
+
+Finds the service from a container for a path and resolve its value. 
+Throws an exception if there is no such service. Called in
+scalar context returns the resolved value, called in list context
+returns 2 elements list (C<< $resolved, $new_state >>).
+
+The optional argument state is a structure returned by previous resolve.
+
+=item
+
+=back
+
+=head2 Functions returning containers
+
+=over 4
+
+=item B<< container({ $path=>$service, $path=>$service, ... }) >>
+
+Returns a container - plain lookup of services. Given a path returns
+the stored service.
+
+=item B<< sub_container({ $name=>$container, $name=>$container, ... }) >>
+
+Returns a container - hierarchical lookup of services. The C<<
+get_service($path) >> method splits the path on first slash (C<< / >>), 
+gets container for the first part and ask it for a service passing the
+second part of the original path.
+
+=item B<< merge_containers($container, $container, ... ) >>
+
+Returns a container containing services from a set of other containers.
+The C<< get_service($path) >> method returns the service from first
+container which contains the path. 
+
+=item B<< container_lazy(&container_builder) >>
+
+Returns a lazily evaluated container. The builder is an anonymous subroutine,
+which must return a container. This builder is called once for the
+first time C<< get_service($path) >> is called.
+
+=back
+
+=head2 Functions returning services
+
+=over 4
+
+=item B<svc_value($any)>
+
+When resolved returns the value unchanged. 
+
+=item B<svc_pos_deps([ $target, ...], \&block)>
+
+Positional dependencies. When resolved, resolve all targets first and then
+calls the block with a list of resolved values. Each target can be either 
+path or a service.
+
+=item B<< svc_named_deps({ key=>$target, key=>$target }, \&block) >>
+
+Named dependencies. When resolved, resolve all targets first and then
+calls the block with a list of key value pairs, where keys are the original
+keys and values are the resolved values. Each target can be either a
+path or a service.
+
+=item B<< svc_defer($target) >>
+
+Lazily evaluated service. Returns not the resolution, but an anonymous
+subroutine which, when called (everytime), resolves the target.
+
+
+=back
+
+
+=cut
+
 # vim: expandtab:shiftwidth=4:tabstop=4:softtabstop=0:textwidth=78:
+
+
