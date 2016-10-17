@@ -405,7 +405,25 @@ __END__
 
 =head1 SYNOPSIS
 
+    use Verbena qw(resolve container svc_pos_deps svc_value);
+    use DBI;
+
+    my $c = container({
+        dsn => svc_value('dsn:Oracle:...'),
+        username => svc_value('someuser'),
+        password => svc_value('somepwd'),
+        dbh => svc_pos_deps(['dsn', 'username', 'password'],
+            sub {
+                my ($dsn, $username, $password) = @_;
+                return DBI->connect($dsn, $username, $password);
+            }),
+    });
+
+    my $dbh = resolve($c, 'dbh');
+
 =head1 DESCRIPTION
+
+Verbena is a simple Dependency Injection library.
 
 =head2 Container
 
@@ -530,9 +548,7 @@ path or a service.
 Lazily evaluated service. Returns not the resolution, but an anonymous
 subroutine which, when called (everytime), resolves the target.
 
-
 =back
-
 
 =cut
 
