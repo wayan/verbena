@@ -258,10 +258,7 @@ sub sub_containers {
         = Type::Params::compile( HashRef [$ContainerType] );
 
     my ($sub_containers) = $params_check->(@_);
-    return bless(
-        { sub_containers => $sub_containers },
-        'Verbena::Container::SubContainers'
-    );
+    return bless( $sub_containers , 'Verbena::Container::SubContainers');
 }
 
 sub container {
@@ -270,8 +267,7 @@ sub container {
 
     my ( $services, $sub_containers ) = $params_check->(@_);
 
-    my $container
-        = bless( { services => $services, }, 'Verbena::Container::Services' );
+    my $container = bless( $services, 'Verbena::Container::Services' );
     return $sub_containers
         ? merge_containers( $container, sub_containers($sub_containers) )
         : $container;
@@ -282,7 +278,7 @@ sub merge_containers {
         = Type::Params::compile( slurpy( ArrayRef [$ContainerType] ) );
     my ($containers) = $params_check->(@_);
     return
-        bless( { containers => $containers, }, 'Verbena::Container::Merged' );
+        bless( $containers, 'Verbena::Container::Merged' );
 }
 
 # lazy container - evaluated when first needed
@@ -318,13 +314,12 @@ sub constructor {
     sub get_service {
         my ( $this, $path ) = @_;
 
-        my @parts = split m{\/}, $path, 2;
-        if ( @parts == 2 ) {
-            if ( my $sub_container = $this->{sub_containers}{ $parts[0] } ) {
-                return $sub_container->get_service( $parts[1] );
-            }
-        }
-        return undef;
+        my ($first, $rest) = $path =~ m{(.*?)/(.*)}
+            or return undef;
+        my $sub_container = $this->{ $first }
+            or return undef;
+
+        return $sub_container->get_service($rest);
     }
 
     sub services {
@@ -333,8 +328,7 @@ sub constructor {
         return pairmap {
             my $prefix = $a;
             map { "$prefix/$_"; } $b->services;
-        }
-        %{ $this->{sub_containers} };
+        } %$this;
     }
 }
 
@@ -345,13 +339,10 @@ sub constructor {
 
     sub get_service {
         my ( $this, $path ) = @_;
-        return $this->{services}{$path};
+        return $this->{$path};
     }
 
-    sub services {
-        my ($this) = @_;
-        return keys %{ $this->{services} };
-    }
+    sub services { keys %{ shift() }; }
 }
 
 {
@@ -363,18 +354,14 @@ sub constructor {
     sub get_service {
         my ( $this, $path ) = @_;
 
-        for my $container ( @{ $this->{containers} } ) {
+        for my $container ( @$this ){
             my $service = $container->get_service($path);
             return $service if $service;
         }
         return;
     }
 
-    sub services {
-        my ($this) = @_;
-
-        return uniq( map { $_->services } @{ $this->{containers} } );
-    }
+    sub services { uniq( map { $_->services } @{ shift() } ); }
 }
 
 {
