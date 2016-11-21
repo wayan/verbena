@@ -1,7 +1,7 @@
 use common::sense;
 use Test::More;
 
-use Verbena qw(container sub_containers container_lazy);
+use Verbena qw(container mount_containers container_lazy);
 
 sub _svc_value {
     my ($v) = @_;
@@ -30,7 +30,7 @@ subtest 'sub containers' => sub {
         }
     );
     my $c2 = container( { 'a' => _svc_value('baz'), } );
-    my $c = sub_containers(
+    my $c = mount_containers(
         {   p  => $c1,
             qq => $c2,
         }

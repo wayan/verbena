@@ -17,17 +17,17 @@ use Class::Load;
 our @EXPORT_OK = qw(
     resolve
     svc_alias
-    svc_value
-    svc_pos_deps
-    svc_named_deps
-    svc_singleton   
+    svc_asis
+    svc_pos
+    svc_named
+    svc_once   
     svc_singleton2
     svc_defer
     merge_containers
     container_lazy
     container
     constructor
-    sub_containers
+    mount_containers
     target_resolver
 );
 
@@ -37,17 +37,17 @@ my $TargetType    = Str | $ServiceType;
 my $default_max_depth = 20;
 
 sub resolve {
-    my ( $container, $path, $state_in ) = @_;
+    my ( $container, $target, $state_in ) = @_;
 
     # passing opaque context
     my ( $resolved, $state_out )
         = _resolve( $container,
-        { ( $state_in ? %$state_in : () ), route => [] }, $path );
+        { ( $state_in ? %$state_in : () ), route => [] }, $target );
     return wantarray ? ( $resolved, $state_out ) : $resolved;
 }
 
 sub _resolve {
-    my ( $container, $state, $path ) = @_;
+    my ( $container, $state, $target ) = @_;
 
     my $route = $state->{route};
     my $max_depth = $state->{max_depth} // $default_max_depth;
@@ -57,9 +57,22 @@ sub _resolve {
             join( ' => ', map {"'$_'"} @$route );
     }
 
-    my $service = $container->get_service($path)
-        or confess sprintf( "No service '%s' (%s)",
-        $path, join( '=> ', map {"'$_'"} @$route, $path ) );
+    my ($path, $service);
+    if ( !ref $target ) {
+
+        # target is a path
+        $path = $target;
+
+        $service = $container->get_service($target)
+            or confess sprintf( "No service '%s' (%s)",
+            $path, join( '=> ', map {"'$_'"} @$route, $path ) );
+    }
+    else {
+        # target is a svc
+        # then the service path is anonymous
+        $service = $target;
+        $path = '#anon';  
+    }
 
     my @new_route = ( @$route, $path );
     my ( $resolved, $state_out ) = $service->(
@@ -88,49 +101,47 @@ sub svc_defer {
     };
 }
 
-sub svc_pos_deps {
+sub svc_pos {
     state $params_check
-        = Type::Params::compile( ArrayRef [$TargetType], CodeRef );
+        = Type::Params::compile( ArrayRef [$TargetType], Optional [CodeRef] );
     my ( $deps, $block ) = $params_check->(@_);
 
-    my $svc_deps = merge_services(
-        map {
-            target_resolver( $deps->[$_], "#$_" )
-        } 0 .. (@$deps - 1)
-    );
+    my $svc_deps
+        = merge_services( map { target_resolver( $deps->[$_], "#$_" ) }
+            0 .. ( @$deps - 1 ) );
 
     # passing state
     return sub {
         my ( $dep_values, $new_state ) = $svc_deps->(@_);
-        return ( scalar( $block->(@$dep_values) ), $new_state );
+
+        # without block svc_pos just returns the resolved deps as an arrayref
+        return ( $block ? scalar( $block->(@$dep_values) ) : $dep_values,
+            $new_state );
     };
 }
 
-sub svc_named_deps {
+sub svc_named {
     state $params_check
-        = Type::Params::compile( HashRef [$TargetType], CodeRef );
+        = Type::Params::compile( HashRef [$TargetType], Optional [CodeRef] );
     my ( $deps, $block ) = $params_check->(@_);
 
-    my @deps_kv = %$deps;
+    my @deps_kv   = %$deps;
     my @dep_names = pairkeys @deps_kv;
-    my $svc_deps = merge_services( pairmap { target_resolver( $b, "#$a" ); } @deps_kv);
+    my $svc_deps  = merge_services( pairmap { target_resolver( $b, "#$a" ); }
+        @deps_kv );
 
     return sub {
         my ( $dep_values, $new_state ) = $svc_deps->(@_);
 
-        return (
-            scalar(
-                $block->(
-                    map { $dep_names[$_] => $dep_values->[$_] }
-                        0 .. ( @dep_names - 1 )
-                )
-            ),
-            $new_state
-        );
+        my @args = map { $dep_names[$_] => $dep_values->[$_] }
+            0 .. ( @dep_names - 1 );
+
+        # without block svc_named just returns the resolved deps as an hashref
+        return ( $block ? scalar( $block->(@args) ) : +{@args}, $new_state );
     };
 }
 
-sub svc_value {
+sub svc_asis {
     my ($value) = @_;
     return sub {$value};
 }
@@ -174,7 +185,8 @@ sub target_resolver {
     confess "Unknown type of dependency";
 }
 
-sub svc_singleton {
+# target is resolved once only
+sub svc_once {
     my ($target) = @_;
 
     my $svc = target_resolver($target);
@@ -212,20 +224,20 @@ sub _get_state {
 }
 
 sub svc_singleton2 {
-    my ($target, $key, $lifetime) = @_;
+    my ($target, $key, $lifecycle) = @_;
 
     $key   //= join( ' at ', (caller(0))[1,2]);
-    $lifetime //= 'singleton';
+    $lifecycle //= 'singleton';
     my $svc = target_resolver($target);
     return sub {
         my ($resolve, $container, $state, $base) = @_;
     
-        if ( my ($stored) = _get_state( $state, 'lifetime', $lifetime, $key ) ) {
+        if ( my ($stored) = _get_state( $state, 'lifecycle', $lifecycle, $key ) ) {
             return $stored;
         }
         # creating new state :-(
         my ($resolved, $new_state) = $svc->($resolve, $container, $state, $base);
-        return ( $resolved, _set_state($new_state, $resolved, 'lifetime', $lifetime, $key));
+        return ( $resolved, _set_state($new_state, $resolved, 'lifecycle', $lifecycle, $key));
     };
     
 }
@@ -252,25 +264,33 @@ sub _join_path {
         : join( '', $start, ( $start ne '' ? '/' : '' ), $part );
 }
 
-# container created with sub_containers
-sub sub_containers {
+# container created with mount_containers
+sub mount_containers {
     state $params_check
         = Type::Params::compile( HashRef [$ContainerType] );
 
-    my ($sub_containers) = $params_check->(@_);
-    return bless( $sub_containers , 'Verbena::Container::SubContainers');
+    my ($mount_containers) = $params_check->(@_);
+    return bless( $mount_containers , 'Verbena::Container::MountContainers');
 }
 
 sub container {
     state $params_check = Type::Params::compile( HashRef [$ServiceType],
         Optional [ HashRef [$ContainerType] ] );
 
-    my ( $services, $sub_containers ) = $params_check->(@_);
+    my ( $services, $containers ) = $params_check->(@_);
 
-    my $container = bless( $services, 'Verbena::Container::Services' );
-    return $sub_containers
-        ? merge_containers( $container, sub_containers($sub_containers) )
-        : $container;
+    return $containers
+        ? (
+        %$services
+        ? merge_containers( _container($services),
+            mount_containers($containers) )
+        : mount_containers($containers)
+        )
+        : _container($services);
+}
+
+sub _container {
+    return bless( shift(), 'Verbena::Container::Services' );
 }
 
 sub merge_containers {
@@ -307,7 +327,7 @@ sub constructor {
 # Simple classes for different types of containers
 {
 
-    package Verbena::Container::SubContainers;
+    package Verbena::Container::MountContainers;
 
     use List::Util qw(pairmap);
 
@@ -316,10 +336,10 @@ sub constructor {
 
         my ($first, $rest) = $path =~ m{(.*?)/(.*)}
             or return undef;
-        my $sub_container = $this->{ $first }
+        my $mount_container = $this->{ $first }
             or return undef;
 
-        return $sub_container->get_service($rest);
+        return $mount_container->get_service($rest);
     }
 
     sub services {
@@ -332,7 +352,6 @@ sub constructor {
     }
 }
 
-# implementation of the containers
 {
 
     package Verbena::Container::Services;
@@ -392,14 +411,14 @@ __END__
 
 =head1 SYNOPSIS
 
-    use Verbena qw(resolve container svc_pos_deps svc_value);
+    use Verbena qw(resolve container svc_pos svc_asis);
     use DBI;
 
     my $c = container({
-        dsn => svc_value('dsn:Oracle:...'),
-        username => svc_value('someuser'),
-        password => svc_value('somepwd'),
-        dbh => svc_pos_deps(['dsn', 'username', 'password'],
+        dsn => svc_asis('dsn:Oracle:...'),
+        username => svc_asis('someuser'),
+        password => svc_asis('somepwd'),
+        dbh => svc_pos(['dsn', 'username', 'password'],
             sub {
                 my ($dsn, $username, $password) = @_;
                 return DBI->connect($dsn, $username, $password);
@@ -410,7 +429,17 @@ __END__
 
 =head1 DESCRIPTION
 
-Verbena is a simple Dependency Injection library.
+Verbena is a simple Dependency Injection library. It was inspired by
+Bread::Board. It is also basically a service locator. 
+Differs from Bread::Board by many ways.
+
+=over 4
+
+=item Verbena is Moose less.
+
+=item No syntactic sugar involved.
+
+=back
 
 =head2 Container
 
@@ -505,7 +534,7 @@ first time C<< get_service($path) >> is called.
 
 =over 4
 
-=item B<svc_value($any)>
+=item B<svc_asis($any)>
 
 When resolved returns the value unchanged. 
 
@@ -517,13 +546,13 @@ When absolute the leading slash is removed and the path is used.
 When relative then the path is "absolutized" according to the 
 path of the service alias.
 
-=item B<svc_pos_deps([ $target, ...], \&block)>
+=item B<svc_pos([ $target, ...], \&block)>
 
 Positional dependencies. When resolved, resolve all targets first and then
 calls the block with a list of resolved values. Each target can be either 
 path or a service.
 
-=item B<< svc_named_deps({ key=>$target, key=>$target }, \&block) >>
+=item B<< svc_named({ key=>$target, key=>$target }, \&block) >>
 
 Named dependencies. When resolved, resolve all targets first and then
 calls the block with a list of key value pairs, where keys are the original
