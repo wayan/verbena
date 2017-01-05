@@ -5,9 +5,9 @@ use common::sense;
 # ABSTRACT: tiny dependency injection container
 
 use List::Util qw(reduce pairmap first pairkeys);
-use Ref::Util qw(is_coderef);
+use Ref::Util qw(is_coderef is_arrayref);
 use Types::Standard
-    qw(HasMethods CodeRef Str ArrayRef HashRef Optional slurpy);
+    qw(HasMethods CodeRef Str ArrayRef HashRef Optional Tuple slurpy);
 use Type::Params ();
 use Carp qw(confess);
 
@@ -120,12 +120,16 @@ sub svc_pos {
     };
 }
 
+# svc_named can work also with arrayref [ 'path', 'path', [ name => 'target' ], ...  ]
 sub svc_named {
-    state $params_check
-        = Type::Params::compile( HashRef [$TargetType], Optional [CodeRef] );
+    state $params_check = Type::Params::compile(
+        ( HashRef [$TargetType] )
+        | ( ArrayRef [ Str | Tuple [ Str, $TargetType] ] ),
+        Optional [CodeRef]
+    );
     my ( $deps, $block ) = $params_check->(@_);
 
-    my @deps_kv   = %$deps;
+    my @deps_kv   = _svc_named_deps($deps);
     my @dep_names = pairkeys @deps_kv;
     my $svc_deps  = merge_services( pairmap { target_resolver( $b, "#$a" ); }
         @deps_kv );
@@ -139,6 +143,20 @@ sub svc_named {
         # without block svc_named just returns the resolved deps as an hashref
         return ( $block ? scalar( $block->(@args) ) : +{@args}, $new_state );
     };
+}
+
+sub _svc_named_deps {
+    my ($deps) = @_;
+
+    return is_arrayref($deps)
+        ? (
+        map {
+                  is_arrayref($_) ? @$_
+                : m{(?:.*/)(.*)} ? ( $1 => $_ )
+                :                  ( $_ => $_ );
+        } @$deps
+        )
+        : %$deps;
 }
 
 sub svc_asis {
