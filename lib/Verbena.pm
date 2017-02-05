@@ -5,11 +5,12 @@ use common::sense;
 # ABSTRACT: tiny dependency injection container
 
 use List::Util qw(reduce pairmap first pairkeys);
-use Ref::Util qw(is_coderef is_arrayref);
+use Ref::Util qw(is_coderef is_arrayref is_hashref is_refref);
+use Scalar::Util qw(blessed);
 use Types::Standard
     qw(HasMethods CodeRef Str ArrayRef HashRef Optional Tuple slurpy);
 use Type::Params ();
-use Carp qw(confess);
+use Carp qw(croak);
 
 use Exporter 'import';
 use Class::Load;
@@ -23,7 +24,6 @@ our @EXPORT_OK = qw(
     svc_once   
     svc_singleton2
     svc_defer
-    merge_containers
     container_lazy
     container
     constructor
@@ -31,69 +31,138 @@ our @EXPORT_OK = qw(
     target_resolver
 );
 
-my $ContainerType = HasMethods ['get_service'];
-my $ServiceType   = CodeRef;
-my $TargetType    = Str | $ServiceType;
 my $default_max_depth = 20;
 
 sub resolve {
-    my ( $container, $target, $state_in ) = @_;
+    my ( $container, $target) = @_;
+
+    if ( is_arrayref($target) ) {
+        my ( $resolved, $state_out )
+            = _resolve_st( $container, init_state(), svc_pos($target) );
+        return wantarray ? @$resolved : $resolved;
+    }
 
     # passing opaque context
-    my ( $resolved, $state_out )
-        = _resolve( $container,
-        { ( $state_in ? %$state_in : () ), route => [] }, $target );
-    return wantarray ? ( $resolved, $state_out ) : $resolved;
+    my ( $resolved, $state_out ) = resolve_st( $container, init_state(), $target );
+    return $resolved;
 }
 
-sub _resolve {
+sub resolve_st {
     my ( $container, $state, $target ) = @_;
 
-    my $route = $state->{route};
-    my $max_depth = $state->{max_depth} // $default_max_depth;
+    if ( !ref $target ) {
 
+        # target is a path
+        my $service = get_service_from( $container, $target );
+        if (!$service){
+            my $route = $state->{'verbena.route'};
+            croak sprintf( "No service '%s' (%s)",
+            $target, join( '=> ', map {"'$_'"} @$route, $target ) );
+        }
+        return _resolve_st( $container, $state, $target, $service );
+    }
+    elsif ( is_coderef($target) ) {
+
+        # target is a svc
+        # then the service path is anonymous
+        return _resolve_st( $container, $state, '#anon', $target );
+    }
+    else {
+        croak "Invalid type of target to resolve '$target'";
+    }
+}
+
+sub init_state { {} }
+
+sub _method_to_fn {
+    my ($fn) = @_;
+
+    return sub {
+        my $this = shift;
+        return $fn->( $$this, @_ );
+    };
+}
+
+sub _resolve_st {
+    my ($container, $state, $path, $service) = @_;
+
+    my $route = $state->{'verbena.route'};
+    my $max_depth = $state->{'verbena.max_depth'} // $default_max_depth;
     if ( @$route > $max_depth ) {
         die "Going too deep with deps: ",
             join( ' => ', map {"'$_'"} @$route );
     }
 
-    my ($path, $service);
-    if ( !ref $target ) {
-
-        # target is a path
-        $path = $target;
-
-        $service = $container->get_service($target)
-            or confess sprintf( "No service '%s' (%s)",
-            $path, join( '=> ', map {"'$_'"} @$route, $path ) );
-    }
-    else {
-        # target is a svc
-        # then the service path is anonymous
-        $service = $target;
-        $path = '#anon';  
-    }
-
     my @new_route = ( @$route, $path );
     my ( $resolved, $state_out ) = $service->(
-        \&_resolve, $container, { %$state, route => \@new_route }, $path
+        $container, { %$state, 'verbena.route' => \@new_route }, $path
     );
 
     # route back
-    return ( $resolved, { %$state_out, route => $route } );
+    return ( $resolved, { %$state_out, 'verbena.route' => $route } );
+}
+
+sub get_service_from {
+    my ($container, $path) = @_;
+
+    return _get_service_from($container, $path, 0);
+}
+
+my $max_depth = 20;  # prevents infinite recursion
+
+sub _get_service_from {
+    my ($container, $path, $depth, $label ) = @_;
+
+    $depth < $max_depth or croak "Too many levels to find a service";
+
+    if (blessed($container )){
+        return $container->get_service($path);
+    }
+
+    elsif (is_hashref($container)){
+        if (exists( $container->{$path})){
+            my $service = $container->{$path};
+            is_coderef($service) or croak "Invalid service $service, coderef is expected";
+            return $service;
+        }
+    }
+    elsif (is_arrayref($container)){
+        for my $cont (@$container){ 
+            my $service = get_service_from($cont, $path);
+            return $service if $service;
+        }
+    }
+    elsif (is_refref($container) && is_hashref($$container)){
+        return get_mount_service_from($$container, $path);
+    }
+    elsif (is_coderef($container)){
+        return get_service_from($container->());
+    }
+    else {  
+        croak "Unrecognized type of container";
+    }
+  
+    return undef; 
+}
+
+sub get_mount_service_from {
+    my ( $cont, $path ) = @_;
+
+    my ( $first, $rest ) = $path =~ m{(.*?)/(.*)}
+        or return undef;
+    my $mount_container = $cont->{$first}
+        or return undef;
+
+    return get_service_from( $mount_container, $rest );
 }
 
 sub svc_alias {
-    state $params_check = Type::Params::compile(Str);
-
-    my ($target) = $params_check->(@_);
+    my ($target) = @_;
     return target_resolver($target);
 }
 
 sub svc_defer {
-    state $params_check = Type::Params::compile($TargetType);
-
-    my ($target) = $params_check->(@_);
+    my ($target) = @_;
     my $resolver = target_resolver($target);
     return sub {
         my @args = @_;
@@ -102,82 +171,100 @@ sub svc_defer {
 }
 
 sub svc_pos {
-    state $params_check
-        = Type::Params::compile( ArrayRef [$TargetType], Optional [CodeRef] );
-    my ( $deps, $block ) = $params_check->(@_);
+    my ($deps, $block) = @_;
 
-    my $svc_deps
-        = merge_services( map { target_resolver( $deps->[$_], "#$_" ) }
-            0 .. ( @$deps - 1 ) );
+    !$block || is_coderef($block)
+        or croak "Invalid block arg for svc_pos";
 
-    # passing state
+    my @targets = _svc_pos_deps($deps);
     return sub {
-        my ( $dep_values, $new_state ) = $svc_deps->(@_);
+        my ($cont, $state, $path) = @_;
+
+        my @resolved;
+        for my $target ( @targets ){
+            my ($res, $new_state) = $target->($cont, $state, $path);
+            push @resolved, $res;
+            $state = $new_state;
+        }
 
         # without block svc_pos just returns the resolved deps as an arrayref
-        return ( $block ? scalar( $block->(@$dep_values) ) : $dep_values,
-            $new_state );
+        return ( $block ? scalar($block->(@resolved)) : \@resolved,
+            $state );
     };
 }
 
 # svc_named can work also with arrayref [ 'path', 'path', [ name => 'target' ], ...  ]
 sub svc_named {
-    state $params_check = Type::Params::compile(
-        ( HashRef [$TargetType] )
-        | ( ArrayRef [ Str | Tuple [ Str, $TargetType] ] ),
-        Optional [CodeRef]
-    );
-    my ( $deps, $block ) = $params_check->(@_);
+    my ($deps, $block) = @_;
 
-    my @deps_kv   = _svc_named_deps($deps);
-    my @dep_names = pairkeys @deps_kv;
-    my $svc_deps  = merge_services( pairmap { target_resolver( $b, "#$a" ); }
-        @deps_kv );
+    !$block || is_coderef($block)
+        or croak "Invalid block arg for svc_named";
 
+    my @targets = _svc_named_deps($deps);
     return sub {
-        my ( $dep_values, $new_state ) = $svc_deps->(@_);
+        my ($cont, $state, $path) = @_;
 
-        my @args = map { $dep_names[$_] => $dep_values->[$_] }
-            0 .. ( @dep_names - 1 );
+        my @resolved;
+        for my $elem ( @targets ){
+            my ($name, $target) = @$elem;
+            my ($res, $new_state) = $target->($cont, $state, $path);
+            push @resolved, $name => $res;
+            $state = $new_state;
+        }
 
-        # without block svc_named just returns the resolved deps as an hashref
-        return ( $block ? scalar( $block->(@args) ) : +{@args}, $new_state );
+        # without block svc_pos just returns the resolved deps as an arrayref
+        return ( $block ? scalar($block->(@resolved)) : \@resolved,
+            $state );
     };
+}
+
+sub _svc_pos_deps {
+    my ($deps) = @_;
+
+    my $i = 0;
+    return map {
+        my $name = '#'. ($i++);
+        target_resolver($_, $name);
+    } @$deps;
 }
 
 sub _svc_named_deps {
     my ($deps) = @_;
 
-    return is_arrayref($deps)
-        ? (
-        map {
-                  is_arrayref($_) ? @$_
-                : m{(?:.*/)(.*)} ? ( $1 => $_ )
-                :                  ( $_ => $_ );
-        } @$deps
-        )
-        : %$deps;
+    if ( is_hashref($deps) ) {
+        return pairmap { [ $a => target_resolver( $b, "#$a" ) ]; } %$deps;
+    }
+    elsif ( is_arrayref($deps) ) {
+        my $i = 0;
+        return map {
+            my $ii = $i++;
+            my $dep = $_;
+
+            my ($name, $target);
+            if (! ref($dep)){
+                ($name) = $dep =~ m{(?:.*/)?(.*)};
+                $target = $dep;
+            }
+            elsif (is_arrayref($dep)){
+                ($name, $target) = @$dep;
+            }
+            else {
+                croak "Unrecognized dep";
+            }
+            
+            [$name => target_resolver( $target, "#$name" )];
+        } @$deps;
+    }
+    else {
+        croak "Invalid dependencies for svc_named";
+    }
 }
 
 sub svc_asis {
     my ($value) = @_;
-    return sub {$value};
-}
-
-# merge services into one - state passing
-sub merge_services {
-    my (@svcs) = @_;
-
-    return sub {
-        my ( $resolve, $container, $state, $base ) = @_;
-        my @resolved;
-        my $current_state = $state;
-        for my $svc (@svcs) {
-            my ( $res, $state ) = $svc->( $resolve, $container, $current_state, $base );
-            push @resolved, $res;
-            $current_state = $state;
-        }
-        return ( \@resolved, $current_state );
+    return sub {    
+        my ($cont, $state, $path) = @_;
+        return ($value, $state);
     };
 }
 
@@ -185,22 +272,24 @@ sub target_resolver {
     my ( $target, $dep_name ) = @_;
 
     if ( !ref $target ) {
-        # string is an alias
+        # $target is a path
         return sub {
-            my ( $resolve, $container, $state, $base ) = @_;
-            return $resolve->(
+            my (  $container, $state, $base ) = @_;
+            return resolve_st(
                 $container, $state, abs_path_to_service( $target, $base )
             );
         };
     }
     elsif ( is_coderef($target) ) {
-        my $suffix = $dep_name // '';
         return sub {
-            my ( $resolve, $container, $state, $base ) = @_;
-            return $target->( $resolve, $container, $state, "$base$suffix" );
+            my ( $container, $state, $base ) = @_;
+
+            $dep_name //= 'anon';
+            $dep_name =~ s{/}{-}g;
+            return $target->( $container, $state, "$base#$dep_name" );
         };
     }
-    confess "Unknown type of dependency";
+    croak "Unknown type of dependency '$target'";
 }
 
 # target is resolved once only
@@ -282,50 +371,6 @@ sub _join_path {
         : join( '', $start, ( $start ne '' ? '/' : '' ), $part );
 }
 
-# container created with mount_containers
-sub mount_containers {
-    state $params_check
-        = Type::Params::compile( HashRef [$ContainerType] );
-
-    my ($mount_containers) = $params_check->(@_);
-    return bless( $mount_containers , 'Verbena::Container::MountContainers');
-}
-
-sub container {
-    state $params_check = Type::Params::compile( HashRef [$ServiceType],
-        Optional [ HashRef [$ContainerType] ] );
-
-    my ( $services, $containers ) = $params_check->(@_);
-
-    return $containers
-        ? (
-        %$services
-        ? merge_containers( _container($services),
-            mount_containers($containers) )
-        : mount_containers($containers)
-        )
-        : _container($services);
-}
-
-sub _container {
-    return bless( shift(), 'Verbena::Container::Services' );
-}
-
-sub merge_containers {
-    state $params_check
-        = Type::Params::compile( slurpy( ArrayRef [$ContainerType] ) );
-    my ($containers) = $params_check->(@_);
-    return
-        bless( $containers, 'Verbena::Container::Merged' );
-}
-
-# lazy container - evaluated when first needed
-sub container_lazy {
-    state $params_check = Type::Params::compile(CodeRef);
-    my ($builder) = $params_check->(@_);
-    return bless( { builder => $builder, }, 'Verbena::Container::Lazy' );
-}
-
 sub constructor {
     state $params_check = Type::Params::compile( Str, Optional [Str] );
 
@@ -339,88 +384,6 @@ sub constructor {
         }
         return $class->$method(@_);
     };
-}
-
-
-# Simple classes for different types of containers
-{
-
-    package Verbena::Container::MountContainers;
-
-    use List::Util qw(pairmap);
-
-    sub get_service {
-        my ( $this, $path ) = @_;
-
-        my ($first, $rest) = $path =~ m{(.*?)/(.*)}
-            or return undef;
-        my $mount_container = $this->{ $first }
-            or return undef;
-
-        return $mount_container->get_service($rest);
-    }
-
-    sub services {
-        my ($this) = @_;
-
-        return pairmap {
-            my $prefix = $a;
-            map { "$prefix/$_"; } $b->services;
-        } %$this;
-    }
-}
-
-{
-
-    package Verbena::Container::Services;
-
-    sub get_service {
-        my ( $this, $path ) = @_;
-        return $this->{$path};
-    }
-
-    sub services { keys %{ shift() }; }
-}
-
-{
-
-    package Verbena::Container::Merged;
-
-    use List::MoreUtils qw(uniq);
-
-    sub get_service {
-        my ( $this, $path ) = @_;
-
-        for my $container ( @$this ){
-            my $service = $container->get_service($path);
-            return $service if $service;
-        }
-        return;
-    }
-
-    sub services { uniq( map { $_->services } @{ shift() } ); }
-}
-
-{
-
-    package Verbena::Container::Lazy;
-
-    sub _container {
-        my $this = shift;
-        return $this->{container} //= $this->{builder}->();
-    }
-
-    sub get_service {
-        my ( $this, $path ) = @_;
-
-        return $this->_container->get_service($path);
-    }
-
-    sub services {
-        my ($this) = @_;
-
-        return $this->_container->services;
-    }
 }
 
 1;
