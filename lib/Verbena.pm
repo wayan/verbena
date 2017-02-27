@@ -7,9 +7,6 @@ use common::sense;
 use List::Util qw(reduce pairmap first pairkeys);
 use Ref::Util qw(is_coderef is_arrayref is_hashref is_refref);
 use Scalar::Util qw(blessed);
-use Types::Standard
-    qw(HasMethods CodeRef Str ArrayRef HashRef Optional Tuple slurpy);
-use Type::Params ();
 use Carp qw(croak);
 
 use Exporter 'import';
@@ -17,18 +14,19 @@ use Class::Load;
 
 our @EXPORT_OK = qw(
     resolve
+    resolve_st
+    init_state
     svc_alias
     svc_asis
     svc_pos
     svc_named
     svc_once   
-    svc_singleton2
+    svc_lifecycle
     svc_defer
-    container_lazy
-    container
     constructor
-    mount_containers
     target_resolver
+
+    get_service_from
 );
 
 my $default_max_depth = 20;
@@ -38,7 +36,7 @@ sub resolve {
 
     if ( is_arrayref($target) ) {
         my ( $resolved, $state_out )
-            = _resolve_st( $container, init_state(), svc_pos($target) );
+            = resolve_st( $container, init_state(), svc_pos($target) );
         return wantarray ? @$resolved : $resolved;
     }
 
@@ -74,15 +72,6 @@ sub resolve_st {
 
 sub init_state { {} }
 
-sub _method_to_fn {
-    my ($fn) = @_;
-
-    return sub {
-        my $this = shift;
-        return $fn->( $$this, @_ );
-    };
-}
-
 sub _resolve_st {
     my ($container, $state, $path, $service) = @_;
 
@@ -108,12 +97,12 @@ sub get_service_from {
     return _get_service_from($container, $path, 0);
 }
 
-my $max_depth = 20;  # prevents infinite recursion
+my $max_container_depth = 20;  # prevents infinite recursion
 
 sub _get_service_from {
     my ($container, $path, $depth, $label ) = @_;
 
-    $depth < $max_depth or croak "Too many levels to find a service";
+    $depth < $max_container_depth or croak "Too many levels to find a service";
 
     if (blessed($container )){
         return $container->get_service($path);
@@ -128,15 +117,15 @@ sub _get_service_from {
     }
     elsif (is_arrayref($container)){
         for my $cont (@$container){ 
-            my $service = get_service_from($cont, $path);
+            my $service = get_service_from($cont, $path, $depth + 1);
             return $service if $service;
         }
     }
     elsif (is_refref($container) && is_hashref($$container)){
-        return get_mount_service_from($$container, $path);
+        return _get_mount_service_from($$container, $path, $depth + 1);
     }
     elsif (is_coderef($container)){
-        return get_service_from($container->());
+        return get_service_from($container->(), $depth + 1);
     }
     else {  
         croak "Unrecognized type of container";
@@ -145,15 +134,15 @@ sub _get_service_from {
     return undef; 
 }
 
-sub get_mount_service_from {
-    my ( $cont, $path ) = @_;
+sub _get_mount_service_from {
+    my ( $cont, $path, $depth ) = @_;
 
     my ( $first, $rest ) = $path =~ m{(.*?)/(.*)}
         or return undef;
     my $mount_container = $cont->{$first}
         or return undef;
 
-    return get_service_from( $mount_container, $rest );
+    return get_service_from( $mount_container, $rest, $depth  );
 }
 
 sub svc_alias {
@@ -223,7 +212,7 @@ sub _svc_pos_deps {
 
     my $i = 0;
     return map {
-        my $name = '#'. ($i++);
+        my $name = ($i++);
         target_resolver($_, $name);
     } @$deps;
 }
@@ -232,14 +221,11 @@ sub _svc_named_deps {
     my ($deps) = @_;
 
     if ( is_hashref($deps) ) {
-        return pairmap { [ $a => target_resolver( $b, "#$a" ) ]; } %$deps;
+        return pairmap { [ $a => target_resolver( $b, $a ) ]; } %$deps;
     }
     elsif ( is_arrayref($deps) ) {
-        my $i = 0;
         return map {
-            my $ii = $i++;
             my $dep = $_;
-
             my ($name, $target);
             if (! ref($dep)){
                 ($name) = $dep =~ m{(?:.*/)?(.*)};
@@ -249,14 +235,14 @@ sub _svc_named_deps {
                 ($name, $target) = @$dep;
             }
             else {
-                croak "Unrecognized dep";
+                croak "Invalid positional dependency $dep";
             }
             
-            [$name => target_resolver( $target, "#$name" )];
+            [$name => target_resolver( $target, $name )];
         } @$deps;
     }
     else {
-        croak "Invalid dependencies for svc_named";
+        croak "Invalid dependencies of svc_named: '$deps'";
     }
 }
 
@@ -299,11 +285,13 @@ sub svc_once {
     my $svc = target_resolver($target);
     my ( $resolved, $value );
     return sub {
-        if ( !$resolved ) {
-            $resolved = 1;
-            $value    = $svc->(@_);
-        }
-        return $value;
+        my ($container, $state, $path) = @_;
+
+        return ($value, $state) if $resolved;
+
+        $resolved = 1;
+        ($value, my $new_state) = $svc->($container, $state, $path);
+        return ($value, $new_state);
     };
 }
 
@@ -330,21 +318,20 @@ sub _get_state {
         : ();
 }
 
-sub svc_singleton2 {
-    my ($target, $key, $lifecycle) = @_;
+sub svc_lifecycle {
+    my ($target, $lifecycle, $key_arg) = @_;
 
-    $key   //= join( ' at ', (caller(0))[1,2]);
-    $lifecycle //= 'singleton';
     my $svc = target_resolver($target);
     return sub {
-        my ($resolve, $container, $state, $base) = @_;
-    
-        if ( my ($stored) = _get_state( $state, 'lifecycle', $lifecycle, $key ) ) {
+        my ($container, $state, $path) = @_;
+   
+        my $key = $key_arg // $path; 
+        if ( my ($stored) = _get_state( $state, 'verbena.lifecycle', $lifecycle, $key ) ) {
             return $stored;
         }
         # creating new state :-(
-        my ($resolved, $new_state) = $svc->($resolve, $container, $state, $base);
-        return ( $resolved, _set_state($new_state, $resolved, 'lifecycle', $lifecycle, $key));
+        my ($resolved, $new_state) = $svc->($container, $state, $path);
+        return ( $resolved, _set_state($new_state, $resolved, 'verbena.lifecycle', $lifecycle, $key));
     };
     
 }
@@ -372,15 +359,14 @@ sub _join_path {
 }
 
 sub constructor {
-    state $params_check = Type::Params::compile( Str, Optional [Str] );
-
-    my ( $class, $method_arg ) = $params_check->(@_);
+    my ( $class, $method_arg ) = @_;
     my $method = $method_arg // 'new';
 
     my $loaded;
     return sub {
         if ( !$loaded ) {
             Class::Load::load_class($class);
+            $loaded = 1;
         }
         return $class->$method(@_);
     };
@@ -410,44 +396,88 @@ __END__
 
 =head1 DESCRIPTION
 
-Verbena is a simple Dependency Injection library. It was inspired by
-Bread::Board. It is also basically a service locator. 
-Differs from Bread::Board by many ways.
+Verbena is a simple Dependency Injection library. Basically a service locator,
+the only purpose of this library is to express dependencies between
+components of your application.  
+
+Verbena is inspired by Bread::Board but differs from Bread::Board in many ways.
 
 =over 4
 
-=item Verbena is Moose less.
+=item The resolution and service organization concerns are separated.
 
-=item No syntactic sugar involved.
+=item The only purpose is to express dependencies. There is no infer feature,
+there is no reflection - you cannot inspect the dependencies of a service, 
+for example.
+
+=item No syntactic sugar involved. 
+
+=item Verbena is only a bunch of function, there is no Moose or other object framework.
 
 =back
 
 =head2 Container
 
-Container is an object with method C<< get_service($path) >> which returns
-a service for given path.
+Container is a structure in which C<resolve> searches for the service by path (possibly recursively).
+It can be:
 
-All the containers returned by the functions from this library have also
-method C<< services() >> which returns all available paths of the container.
+=over 4
+
+=item hashref (of services)
+
+    {
+        $path1 => $service1,
+        $path2 => $service2,
+        ...
+    }
+
+A simple service lookup.
+
+=item arrayref (of containers)
+
+    [ $container1, $container2, ... ]
+
+The service is searched for in first container from the array. If found the
+service is returned otherwise the rest of the array is tried.
+
+=item reference to hashref (of containers)
+
+    \ {   Database => {
+            dsn     => svc_pos(...),
+            storage => svc_pos(...),
+        },
+        REST => { ... }
+    }
+
+"Mounted" containers. Part of the path up to first slash is used to find a
+container in a hash. Part of the path after the slash is used to search 
+for the service in the container.
+
+=item object
+
+Method C<< get_service($path) >> is called to get a service. Method should
+return the service or undef (container does not contain the service).
+
+=item code reference
+
+The subroutine is just called with C<< $path >>.
+
+=back
 
 =head2 Service
 
 Service is an anonymous subroutine which returns a component of your
-application addressed by a path. The service is (so far) called as
+application addressed by a path. The service is called as
 
-    $service->($resolve, $container, $state, $path)
+    ($value, $new_state) = $service->($container, $state, $path)
 
 The parameters are:
 
 =over 4
 
-=item C<< $resolve >>
-
-The anonymous subroutine which can be used to resolve the dependencies of the service.
-
 =item C<< $container >>
 
-The container which was passed to resolve. 
+The container passed to resolve. 
 
 =item C<< $state >>
 
@@ -455,7 +485,7 @@ The structure (opaque for most services) containing the state of resolving ().
 
 =item C<< $path >>
 
-The path of currently resolved. It must be noted the path is passed, it is not
+The path of the service currently resolved. It must be noted the path is passed, it is not
 part of the service. It means that the exactly the same service (the coderef)
 can be used for different paths in the container.
 
@@ -463,51 +493,39 @@ can be used for different paths in the container.
 
 The service is supposed to return two values list C<< ($resolved, $new_state) >>
 
-
 =head1 FUNCTIONS
+
+All functions can be imported on demand or called with qualified name.
 
 =over 4 
 
-=item B<< resolve( $container, $path, [ $state ] ) >>
+=item B<< resolve( $container, $target ) >>
+
+    $value = resolve( $container, $target);
+
+
+Resolve a service from the container.
 
 Finds the service from a container for a path and resolve its value. 
-Throws an exception if there is no such service. Called in
-scalar context returns the resolved value, called in list context
-returns 2 elements list (C<< $resolved, $new_state >>).
+Throws an exception if there is no such service. 
 
-The optional argument state is a structure returned by previous resolve.
+The C<< $target >> can be either path or service. The resolve can also be used
+to resolve more services at once:
 
-=item
+    my ( $resolved1, $resolved2, ... ) = resolve( $container, [ $path1, $path2, ... ] );
 
-=back
+=item B<< init_state() >>
 
-=head2 Functions returning containers
+=item B<< resolve_st($container, $state, $target) >>
 
-=over 4
+Revealing the state of the resolution
 
-=item B<< container({ $path=>$service, $path=>$service, ... }) >>
-
-Returns a container - plain lookup of services. Given a path returns
-the stored service.
-
-=item B<< sub_container({ $name=>$container, $name=>$container, ... }) >>
-
-Returns a container - hierarchical lookup of services. The 
-C<< get_service($path) >> method splits the path on first slash (C<< / >>), 
-gets container for the first part and ask it for a service passing the
-second part of the original path.
-
-=item B<< merge_containers($container, $container, ... ) >>
-
-Returns a container containing services from a set of other containers.
-The C<< get_service($path) >> method returns the service from first
-container which contains the path. 
-
-=item B<< container_lazy(&container_builder) >>
-
-Returns a lazily evaluated container. The builder is an anonymous subroutine,
-which must return a container. This builder is called once for the
-first time C<< get_service($path) >> is called.
+    my $state = Verbena::init_state();
+    (my $value1, $state) = resolve_st( $container, $state, $target1);
+    ...
+    (my $value2, $state) = resolve_st( $container, $state, $target2);
+    ...
+    
 
 =back
 
@@ -515,9 +533,9 @@ first time C<< get_service($path) >> is called.
 
 =over 4
 
-=item B<svc_asis($any)>
+=item B<< svc_asis($any) >>
 
-When resolved returns the value unchanged. 
+When resolved returns the value passed unchanged. 
 
 =item B<< svc_alias($path) >>
 
@@ -527,23 +545,65 @@ When absolute the leading slash is removed and the path is used.
 When relative then the path is "absolutized" according to the 
 path of the service alias.
 
-=item B<svc_pos([ $target, ...], \&block)>
+=item B<< svc_pos([ $target, ...], \&block) >>
 
-Positional dependencies. When resolved, resolve all targets first and then
-calls the block with a list of resolved values. Each target can be either 
-path or a service.
+    # dbh service
+    svc_pos(
+        [   '../Database/dsn', '/Database/username', '../Database/auth',
+            svc_asis( { RaiseError => 1, AutoCommit => 0 } )
+        ],
+        sub {
+            DBI->connect(@_);
+        }
+    )
+
+Positional dependencies. Calls the block with a list from all targets resolved.
+Each target is either a string (path) or a service. 
+
+The path can be either absolute (starting with C<<  / >>) or relative,
+parent "directory" C<..> an be used in relative paths.
+
+Block can be omitted. In such case a default block (below) is used.
+
+    sub { return [ @_ ] }
+
 
 =item B<< svc_named({ key=>$target, key=>$target }, \&block) >>
 
-Named dependencies. When resolved, resolve all targets first and then
-calls the block with a list of key value pairs, where keys are the original
-keys and values are the resolved values. Each target can be either a
-path or a service.
+=item B<< svc_named([ $path1, $path2, ... ], \&block) >>
+
+Named dependencies. Calls the block with a list of key value pairs, 
+where values are the resolved values. Each target can be either a path or a service.
+
+If dependencies definition (first argument) is an arrayref, each element is
+converted to C<< key => target >> pair. The element can be a string ($path), 
+the key is constructed as basename of the path (the part after last slash). 
+The element can be also a reference to two elements array C<< [ $key, $target ] >>.
+
+Block can be omitted. In such case a default block (below) is used.
+
+    sub { return +{ @_ } }
 
 =item B<< svc_defer($target) >>
 
 Lazily evaluated service. Returns not the resolution, but an anonymous
 subroutine which, when called (everytime), resolves the target.
+
+=back
+
+=head2 Utility functions
+
+=over 4
+
+=item B<< constructor($class) >>
+
+Returns callback to be used in C<< svc_pos >> or C<< svc_named >>, basically
+C<< sub { $class->new(@_) } >>. Load the class lazily (when the callback
+returned is called for the first time, i.e when the service is resolved).
+
+=item B<< get_service_from($container, $path) >>
+
+Finds the service (anonymous sub) from a container (described above).
 
 =back
 
