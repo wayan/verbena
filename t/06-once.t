@@ -5,7 +5,7 @@ use Test::More;
 my $i   = 0;
 my $svc = sub {
     my ( $container, $state, $path ) = @_;
-    return ( ++$i, $state );
+    return [ ++$i, $state ];
 };
 
 my $c = {

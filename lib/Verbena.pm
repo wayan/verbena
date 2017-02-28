@@ -36,12 +36,12 @@ sub resolve {
 
     if ( is_arrayref($target) ) {
         my ( $resolved, $state_out )
-            = resolve_st( $container, init_state(), svc_pos($target) );
+            = @{resolve_st( $container, init_state(), svc_pos($target) )};
         return wantarray ? @$resolved : $resolved;
     }
 
     # passing opaque context
-    my ( $resolved, $state_out ) = resolve_st( $container, init_state(), $target );
+    my ( $resolved, $state_out ) = @{resolve_st( $container, init_state(), $target )};
     return $resolved;
 }
 
@@ -83,12 +83,13 @@ sub _resolve_st {
     }
 
     my @new_route = ( @$route, $path );
-    my ( $resolved, $state_out ) = $service->(
+    my $svc_ret = $service->(
         $container, { %$state, 'verbena.route' => \@new_route }, $path
     );
 
-    # route back
-    return ( $resolved, { %$state_out, 'verbena.route' => $route } );
+    # sets route back
+    my ( $resolved, $state_out ) = @$svc_ret;
+    return [ $resolved, { %$state_out, 'verbena.route' => $route } ];
 }
 
 sub get_service_from {
@@ -171,14 +172,14 @@ sub svc_pos {
 
         my @resolved;
         for my $target ( @targets ){
-            my ($res, $new_state) = $target->($cont, $state, $path);
+            my ($res, $new_state) = @{$target->($cont, $state, $path)};
             push @resolved, $res;
             $state = $new_state;
         }
 
         # without block svc_pos just returns the resolved deps as an arrayref
-        return ( $block ? scalar($block->(@resolved)) : \@resolved,
-            $state );
+        return [ $block ? scalar($block->(@resolved)) : \@resolved,
+            $state ];
     };
 }
 
@@ -196,14 +197,14 @@ sub svc_named {
         my @resolved;
         for my $elem ( @targets ){
             my ($name, $target) = @$elem;
-            my ($res, $new_state) = $target->($cont, $state, $path);
+            my ($res, $new_state) = @{$target->($cont, $state, $path)};
             push @resolved, $name => $res;
             $state = $new_state;
         }
 
         # without block svc_pos just returns the resolved deps as an arrayref
-        return ( $block ? scalar($block->(@resolved)) : \@resolved,
-            $state );
+        return [ $block ? scalar($block->(@resolved)) : \@resolved,
+            $state ];
     };
 }
 
@@ -248,9 +249,9 @@ sub _svc_named_deps {
 
 sub svc_asis {
     my ($value) = @_;
-    return sub {    
-        my ($cont, $state, $path) = @_;
-        return ($value, $state);
+    return sub {
+        my ( $cont, $state, $path ) = @_;
+        return [ $value, $state ];
     };
 }
 
@@ -287,11 +288,14 @@ sub svc_once {
     return sub {
         my ($container, $state, $path) = @_;
 
-        return ($value, $state) if $resolved;
+        if ($resolved){
+            return [$value, $state];
+        }
 
         $resolved = 1;
-        ($value, my $new_state) = $svc->($container, $state, $path);
-        return ($value, $new_state);
+        my ($v, $new_state) = @{$svc->($container, $state, $path)};
+        ( $resolved, $value) = (1, $v);
+        return [$value, $new_state];
     };
 }
 
@@ -330,8 +334,8 @@ sub svc_lifecycle {
             return $stored;
         }
         # creating new state :-(
-        my ($resolved, $new_state) = $svc->($container, $state, $path);
-        return ( $resolved, _set_state($new_state, $resolved, 'verbena.lifecycle', $lifecycle, $key));
+        my ($resolved, $new_state) = @{$svc->($container, $state, $path)};
+        return [ $resolved, _set_state($new_state, $resolved, 'verbena.lifecycle', $lifecycle, $key)];
     };
     
 }
@@ -469,7 +473,8 @@ The subroutine is just called with C<< $path >>.
 Service is an anonymous subroutine which returns a component of your
 application addressed by a path. The service is called as
 
-    ($value, $new_state) = $service->($container, $state, $path)
+    my $ret = $service->($container, $state, $path);
+    my ($value, $new_state) = @$ret;
 
 The parameters are:
 
@@ -491,7 +496,7 @@ can be used for different paths in the container.
 
 =back
 
-The service is supposed to return two values list C<< ($resolved, $new_state) >>
+The service is supposed to return two values array reference C<< ($resolved, $new_state) >>
 
 =head1 FUNCTIONS
 
