@@ -15,14 +15,14 @@ is( _resolve(
         'x',
     ),
     'first',
-    'Plain hash search',
+    'Hash source',
 );
 
 is( _resolve(
         [   { x => sub {'a'}, },
             { y => sub {'b'}, },
-            {   x => sub {'A'},
-                y => sub {'B'}
+            { x => sub {'A'},
+              y => sub {'B'}
             }
         ],
         'y',

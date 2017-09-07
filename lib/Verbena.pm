@@ -7,89 +7,110 @@ use common::sense;
 use List::Util qw(reduce pairmap first pairkeys);
 use Ref::Util qw(is_coderef is_arrayref is_hashref is_refref);
 use Scalar::Util qw(blessed);
-use Carp qw(croak);
+use Carp qw(confess);
 
 use Exporter 'import';
 use Class::Load;
 
 our @EXPORT_OK = qw(
     resolve
-    resolve_st
-    init_state
     svc_alias
     svc_asis
     svc_pos
     svc_named
-    svc_once   
-    svc_lifecycle
     svc_defer
     constructor
-    target_resolver
-
+    svc_dep
     get_service_from
 );
 
-my $default_max_depth = 20;
+my $MAX_STACK_DEPTH = 20;
 
-sub resolve {
-    my ( $container, $target) = @_;
+sub extract {
+    my ($container, $target, $opts) = @_;
 
-    if ( is_arrayref($target) ) {
-        my ( $resolved, $state_out )
-            = @{resolve_st( $container, init_state(), svc_pos($target) )};
-        return wantarray ? @$resolved : $resolved;
-    }
-
-    # passing opaque context
-    my ( $resolved, $state_out ) = @{resolve_st( $container, init_state(), $target )};
-    return $resolved;
+    return _extract( $container, is_path($target) ? $target : 'anon',
+        $target, $opts, [] );
 }
 
-sub resolve_st {
-    my ( $container, $state, $target ) = @_;
+sub extract_no_state {
+    my ($container, $target, $opts) = @_;
 
-    if ( !ref $target ) {
+    my $code = _extract( $container, is_path($target) ? $target : 'anon',
+        $target, $opts, [] );
+    return sub {
+        my ($state) = @_;
+        my ($new_state, $value) = @{$code->($state // {} )};
+        return $value;
+    };
+}
 
-        # target is a path
-        my $service = get_service_from( $container, $target );
-        if (!$service){
-            my $route = $state->{'verbena.route'};
-            croak sprintf( "No service '%s' (%s)",
-            $target, join( '=> ', map {"'$_'"} @$route, $target ) );
-        }
-        return _resolve_st( $container, $state, $target, $service );
+*is_service = \&is_coderef;
+
+sub is_path {
+    my ($candidate) = @_;
+
+    return !ref($candidate) || (blessed($candidate) && $candidate->isa('Verbena::Path'));
+}
+
+sub _extract {
+    my ( $container, $path, $target,  $opts, $stack ) = @_;
+
+    my $max_stack_depth = $opts && $opts->{max_stack_depth} || $MAX_STACK_DEPTH;
+    if ( @$stack > $max_stack_depth ) {
+        confess "Dependencies are too deep: " . _dump_stack($stack);
     }
-    elsif ( is_coderef($target) ) {
 
-        # target is a svc
-        # then the service path is anonymous
-        return _resolve_st( $container, $state, '#anon', $target );
+    my @new_stack = (@$stack, $path);
+    if ( is_service($target) ) {
+        return $target->( $container, $path, $opts, \@new_stack );
+    }
+    elsif ( is_path($target)){
+        my $service = get_service_from( $container, $path, $opts );
+        if ( !$service ) {
+            confess sprintf( "No service '%s' (%s)",
+                $path, _dump_stack( \@new_stack ) );
+        }
+        return $service->( $container, $path, $opts, \@new_stack );
     }
     else {
-        croak "Invalid type of target to resolve '$target'";
+        die "Invalid type of target";
     }
 }
 
-sub init_state { {} }
+sub _dump_stack {
+    my ($stack) = @_;
 
-sub _resolve_st {
-    my ($container, $state, $path, $service) = @_;
+    join ' => ', map { "'$_'" } @$stack;
+}
 
-    my $route = $state->{'verbena.route'};
-    my $max_depth = $state->{'verbena.max_depth'} // $default_max_depth;
-    if ( @$route > $max_depth ) {
-        die "Going too deep with deps: ",
-            join( ' => ', map {"'$_'"} @$route );
-    }
+sub svc_singleton {
+    my ($target) = @_;
 
-    my @new_route = ( @$route, $path );
-    my $svc_ret = $service->(
-        $container, { %$state, 'verbena.route' => \@new_route }, $path
-    );
+    my $svc = svc_dep($target);
+    sub {
+        my ($container, $path) = @_;
+        my $code = $svc->(@_);
+        my $the_path = "$path";
+        sub {
+            my ($state) = @_;
 
-    # sets route back
-    my ( $resolved, $state_out ) = @$svc_ret;
-    return [ $resolved, { %$state_out, 'verbena.route' => $route } ];
+            if ( exists( $state->{$the_path} ) ) {
+                return [ $state->{$the_path}, $state ];
+            }
+
+            my ($value, $new_state) = @{$code->($state)};
+            return [ $value, { %$new_state, $the_path => $value} ];
+        };
+    };
+}
+
+sub resolve {
+    my ( $container, $target, $opts) = @_;
+
+    my $code = _extract($container, $target, $target, $opts, []);
+    my ($value, $state) = @{$code->({})};
+    return $value;
 }
 
 sub get_service_from {
@@ -101,9 +122,9 @@ sub get_service_from {
 my $max_container_depth = 20;  # prevents infinite recursion
 
 sub _get_service_from {
-    my ($container, $path, $depth, $label ) = @_;
+    my ($container, $path, $depth ) = @_;
 
-    $depth < $max_container_depth or croak "Too many levels to find a service";
+    $depth < $max_container_depth or confess "Too many levels to find a service";
 
     if (blessed($container )){
         return $container->get_service($path);
@@ -112,12 +133,12 @@ sub _get_service_from {
     elsif (is_hashref($container)){
         if (exists( $container->{$path})){
             my $service = $container->{$path};
-            is_coderef($service) or croak "Invalid service $service, coderef is expected";
+            is_service($service) or confess "Invalid service $service, coderef is expected";
             return $service;
         }
     }
     elsif (is_arrayref($container)){
-        for my $cont (@$container){ 
+        for my $cont (@$container){
             my $service = get_service_from($cont, $path, $depth + 1);
             return $service if $service;
         }
@@ -128,11 +149,11 @@ sub _get_service_from {
     elsif (is_coderef($container)){
         return get_service_from($container->(), $depth + 1);
     }
-    else {  
-        croak "Unrecognized type of container";
+    else {
+        confess "Unrecognized type of container";
     }
-  
-    return undef; 
+
+    return undef;
 }
 
 sub _get_mount_service_from {
@@ -146,17 +167,39 @@ sub _get_mount_service_from {
     return get_service_from( $mount_container, $rest, $depth  );
 }
 
+sub svc_asis {
+    my ($value) = @_;
+
+    return sub {
+        return sub { my ($state) = @_; return [ $value, $state ] };
+    };
+}
+
 sub svc_alias {
     my ($target) = @_;
-    return target_resolver($target);
+
+    is_path($target)
+        or confess "Invalid target for the svc_alias";
+    return svc_dep($target);
 }
 
 sub svc_defer {
     my ($target) = @_;
-    my $resolver = target_resolver($target);
+
+    my $svc = svc_dep($target);
     return sub {
-        my @args = @_;
-        return sub { $resolver->(@args) };
+        my ($container, $path, $stack) = @_;
+        return sub {
+            my ($state) = @_;
+            return [
+                sub {
+                    my $code = $svc->($container, $path, []);
+                    my ( $value, $new_state ) = @{$code->($state)};
+                    return $value;
+                },
+                $state
+            ];
+        };
     };
 }
 
@@ -164,187 +207,115 @@ sub svc_pos {
     my ($deps, $block) = @_;
 
     !$block || is_coderef($block)
-        or croak "Invalid block arg for svc_pos";
+        or confess "Invalid block arg for svc_pos";
 
-    my @targets = _svc_pos_deps($deps);
+    my $i = 0;
+    my @services = map { svc_dep($_, $i++); } @$deps;
     return sub {
-        my ($cont, $state, $path) = @_;
+        my @args = @_;
+        my @codes = map { $_->(@args) } @services;
 
-        my @resolved;
-        for my $target ( @targets ){
-            my ($res, $new_state) = @{$target->($cont, $state, $path)};
-            push @resolved, $res;
-            $state = $new_state;
-        }
+        return sub {
+            my ($state) = @_;
 
-        # without block svc_pos just returns the resolved deps as an arrayref
-        return [ $block ? scalar($block->(@resolved)) : \@resolved,
-            $state ];
+            my @resolved;
+            for my $code (@codes) {
+                my ( $res, $new_state ) = @{ $code->( $state ) };
+                push @resolved, $res;
+                $state = $new_state;
+            }
+
+            # without block svc_pos just returns the resolved deps as an arrayref
+            my $value = $block ? $block->(@resolved) : \@resolved;
+            return [ $value, $state ];
+        };
     };
 }
+
 
 # svc_named can work also with arrayref [ 'path', 'path', [ name => 'target' ], ...  ]
 sub svc_named {
-    my ($deps, $block) = @_;
+    my ( $deps, $block ) = @_;
 
     !$block || is_coderef($block)
-        or croak "Invalid block arg for svc_named";
+        or confess "Invalid block arg for svc_named";
 
-    my @targets = _svc_named_deps($deps);
-    return sub {
-        my ($cont, $state, $path) = @_;
-
-        my @resolved;
-        for my $elem ( @targets ){
-            my ($name, $target) = @$elem;
-            my ($res, $new_state) = @{$target->($cont, $state, $path)};
-            push @resolved, $name => $res;
-            $state = $new_state;
-        }
-
-        # without block svc_pos just returns the resolved deps as an arrayref
-        return [ $block ? scalar($block->(@resolved)) : \@resolved,
-            $state ];
-    };
-}
-
-sub _svc_pos_deps {
-    my ($deps) = @_;
-
-    my $i = 0;
-    return map {
-        my $name = ($i++);
-        target_resolver($_, $name);
-    } @$deps;
-}
-
-sub _svc_named_deps {
-    my ($deps) = @_;
+    my (@names, @services);
 
     if ( is_hashref($deps) ) {
-        return pairmap { [ $a => target_resolver( $b, $a ) ]; } %$deps;
+        @names = keys %$deps;
+        @services = map { svc_dep( $deps->{$_}, $_ ); } @names;
     }
     elsif ( is_arrayref($deps) ) {
-        return map {
-            my $dep = $_;
-            my ($name, $target);
+        for my $dep ( @$deps){
             if (! ref($dep)){
-                ($name) = $dep =~ m{(?:.*/)?(.*)};
-                $target = $dep;
+                my ($name) = $dep =~ m{(?:.*/)?(.*)};
+                push @names, $name;
+                push @services, svc_dep($dep, $name);
             }
             elsif (is_arrayref($dep)){
-                ($name, $target) = @$dep;
+                my ($name, $target) = @$dep;
+                push @names, $name;
+                push @services, svc_dep($target, $name);
             }
             else {
-                croak "Invalid positional dependency $dep";
+                confess "Invalid named dependency $dep";
             }
-            
-            [$name => target_resolver( $target, $name )];
-        } @$deps;
+        }
     }
     else {
-        croak "Invalid dependencies of svc_named: '$deps'";
+        confess "Invalid dependencies of svc_named: '$deps'";
     }
-}
 
-sub svc_asis {
-    my ($value) = @_;
     return sub {
-        my ( $cont, $state, $path ) = @_;
-        return [ $value, $state ];
+        my @args = @_;
+        my @codes = map { $_->(@args) } @services;
+
+        return sub {
+            my ($state) = @_;
+            my @resolved;
+            my $i = 0;
+            for my $code (@codes) {
+                my ( $res, $new_state ) = @{ $code->( $state ) };
+                push @resolved, $names[$i++] => $res;
+                $state = $new_state;
+            }
+
+            # without block svc_named just returns the resolved deps as an hashref
+            my $value = $block ? $block->(@resolved) : +{ @resolved };
+            return [ $value, $state ];
+        };
     };
 }
 
-sub target_resolver {
+sub svc_dep {
     my ( $target, $dep_name ) = @_;
 
-    if ( !ref $target ) {
+    if ( is_path($target)  ) {
         # $target is a path
         return sub {
-            my (  $container, $state, $base ) = @_;
-            return resolve_st(
-                $container, $state, abs_path_to_service( $target, $base )
-            );
+            my ( $container, $base, $opts, $stack ) = @_;
+            my $path = abs_path_to_service( $target, $base );
+            return _extract( $container, $path, $path, $opts, $stack);
         };
     }
-    elsif ( is_coderef($target) ) {
+    elsif ( is_service($target) ) {
         return sub {
-            my ( $container, $state, $base ) = @_;
-
-            $dep_name //= 'anon';
-            $dep_name =~ s{/}{-}g;
-            return $target->( $container, $state, "$base#$dep_name" );
+            my ( $container, $base, $opts, $stack ) = @_;
+            my $path = [ ref($base) ? @$base : $base, $dep_name // 'anon' ];
+            return _extract( $container, $path, $target, $opts, $stack );
         };
     }
-    croak "Unknown type of dependency '$target'";
-}
-
-# target is resolved once only
-sub svc_once {
-    my ($target) = @_;
-
-    my $svc = target_resolver($target);
-    my ( $resolved, $value );
-    return sub {
-        my ($container, $state, $path) = @_;
-
-        if ($resolved){
-            return [$value, $state];
-        }
-
-        $resolved = 1;
-        my ($v, $new_state) = @{$svc->($container, $state, $path)};
-        ( $resolved, $value) = (1, $v);
-        return [$value, $new_state];
-    };
-}
-
-# immutable set state of nested key
-sub _set_state {
-    my ($data, $value, $key, @keys) = @_;
-    return {
-        %$data,
-        $key => (
-            @keys
-            ? _set_state( $data->{$key} // {}, $value, @keys )
-            : $value
-        )
-    };
-}
-
-# get the nested value from the state
-# returns ($value) - unempty list or ()
-sub _get_state {
-    my ( $data, $key, @keys ) = @_;
-    return
-        exists $data->{$key}
-        ? ( @keys ? _get_state( $data->{$key}, @keys ) : ( $data->{$key} ) )
-        : ();
-}
-
-sub svc_lifecycle {
-    my ($target, $lifecycle, $key_arg) = @_;
-
-    my $svc = target_resolver($target);
-    return sub {
-        my ($container, $state, $path) = @_;
-   
-        my $key = $key_arg // $path; 
-        if ( my ($stored) = _get_state( $state, 'verbena.lifecycle', $lifecycle, $key ) ) {
-            return $stored;
-        }
-        # creating new state :-(
-        my ($resolved, $new_state) = @{$svc->($container, $state, $path)};
-        return [ $resolved, _set_state($new_state, $resolved, 'verbena.lifecycle', $lifecycle, $key)];
-    };
-    
+    confess "Unknown type of dependency '$target'";
 }
 
 sub abs_path_to_service {
     my ( $target, $base ) = @_;
 
     return $1 if $target =~ m{^/(.*)};
-    return reduce { _join_path( $a, $b ); } _dir($base), split m{/}, $target;
+
+    my $bbase = ref($base)? $base->[0]: $base;
+    return reduce { _join_path( $a, $b ); } _dir($bbase), split m{/}, $target;
 }
 
 sub _dir {
@@ -376,6 +347,26 @@ sub constructor {
     };
 }
 
+{
+    package Verbena::Path;
+    # path with the dependencies
+
+    use overload '""' => sub {
+            return shift()->to_string();
+        },
+        fallback => 1;
+
+    sub new {
+        my ($base, $dep_name) = @_;
+        return bless([ $base, $dep_name], __PACKAGE__);
+    }
+
+    sub to_string {
+        my $this = shift;
+        return join('#', @$this);
+    }
+}
+
 1;
 
 __END__
@@ -402,7 +393,7 @@ __END__
 
 Verbena is a simple Dependency Injection library. Basically a service locator,
 the only purpose of this library is to express dependencies between
-components of your application.  
+components of your application.
 
 Verbena is inspired by Bread::Board but differs from Bread::Board in many ways.
 
@@ -411,10 +402,10 @@ Verbena is inspired by Bread::Board but differs from Bread::Board in many ways.
 =item The resolution and service organization concerns are separated.
 
 =item The only purpose is to express dependencies. There is no infer feature,
-there is no reflection - you cannot inspect the dependencies of a service, 
+there is no reflection - you cannot inspect the dependencies of a service,
 for example.
 
-=item No syntactic sugar involved. 
+=item No syntactic sugar involved.
 
 =item Verbena is only a bunch of function, there is no Moose or other object framework.
 
@@ -454,7 +445,7 @@ service is returned otherwise the rest of the array is tried.
     }
 
 "Mounted" containers. Part of the path up to first slash is used to find a
-container in a hash. Part of the path after the slash is used to search 
+container in a hash. Part of the path after the slash is used to search
 for the service in the container.
 
 =item object
@@ -471,9 +462,10 @@ The subroutine is just called with C<< $path >>.
 =head2 Service
 
 Service is an anonymous subroutine which returns a component of your
-application addressed by a path. The service is called as
+application addressed by a path. The service is called with two sets
+of parameters
 
-    my $ret = $service->($container, $state, $path);
+    my $ret = $service->($container, $path, $stack)->($state);
     my ($value, $new_state) = @$ret;
 
 The parameters are:
@@ -482,17 +474,17 @@ The parameters are:
 
 =item C<< $container >>
 
-The container passed to resolve. 
-
-=item C<< $state >>
-
-The structure (opaque for most services) containing the state of resolving ().
+The container passed to resolve.
 
 =item C<< $path >>
 
 The path of the service currently resolved. It must be noted the path is passed, it is not
 part of the service. It means that the exactly the same service (the coderef)
 can be used for different paths in the container.
+
+=item C<< $state >>
+
+The structure (opaque for most services) containing the state of resolving ().
 
 =back
 
@@ -502,7 +494,7 @@ The service is supposed to return two values array reference C<< ($resolved, $ne
 
 All functions can be imported on demand or called with qualified name.
 
-=over 4 
+=over 4
 
 =item B<< resolve( $container, $target ) >>
 
@@ -511,8 +503,8 @@ All functions can be imported on demand or called with qualified name.
 
 Resolve a service from the container.
 
-Finds the service from a container for a path and resolve its value. 
-Throws an exception if there is no such service. 
+Finds the service from a container for a path and resolve its value.
+Throws an exception if there is no such service.
 
 The C<< $target >> can be either path or service. The resolve can also be used
 to resolve more services at once:
@@ -530,7 +522,7 @@ Revealing the state of the resolution
     ...
     (my $value2, $state) = resolve_st( $container, $state, $target2);
     ...
-    
+
 
 =back
 
@@ -540,14 +532,14 @@ Revealing the state of the resolution
 
 =item B<< svc_asis($any) >>
 
-When resolved returns the value passed unchanged. 
+When resolved returns the value passed unchanged.
 
 =item B<< svc_alias($path) >>
 
 When resolved returns the value of service addressed by the path.
 The path may be either absolute (starting with slash) or relative.
 When absolute the leading slash is removed and the path is used.
-When relative then the path is "absolutized" according to the 
+When relative then the path is "absolutized" according to the
 path of the service alias.
 
 =item B<< svc_pos([ $target, ...], \&block) >>
@@ -563,7 +555,7 @@ path of the service alias.
     )
 
 Positional dependencies. Calls the block with a list from all targets resolved.
-Each target is either a string (path) or a service. 
+Each target is either a string (path) or a service.
 
 The path can be either absolute (starting with C<<  / >>) or relative,
 parent "directory" C<..> an be used in relative paths.
@@ -577,12 +569,12 @@ Block can be omitted. In such case a default block (below) is used.
 
 =item B<< svc_named([ $path1, $path2, ... ], \&block) >>
 
-Named dependencies. Calls the block with a list of key value pairs, 
+Named dependencies. Calls the block with a list of key value pairs,
 where values are the resolved values. Each target can be either a path or a service.
 
 If dependencies definition (first argument) is an arrayref, each element is
-converted to C<< key => target >> pair. The element can be a string ($path), 
-the key is constructed as basename of the path (the part after last slash). 
+converted to C<< key => target >> pair. The element can be a string ($path),
+the key is constructed as basename of the path (the part after last slash).
 The element can be also a reference to two elements array C<< [ $key, $target ] >>.
 
 Block can be omitted. In such case a default block (below) is used.
