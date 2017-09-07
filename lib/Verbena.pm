@@ -14,6 +14,8 @@ use Class::Load;
 
 our @EXPORT_OK = qw(
     resolve
+    extract
+    extract_no_state
     svc_alias
     svc_asis
     svc_pos
@@ -29,8 +31,11 @@ my $MAX_STACK_DEPTH = 20;
 sub extract {
     my ($container, $target, $opts) = @_;
 
-    return _extract( $container, is_path($target) ? $target : 'anon',
+    my $code = _extract( $container, is_path($target) ? $target : 'anon',
         $target, $opts, [] );
+    return sub {
+        return $code->(@_ ? @_: {});
+    };
 }
 
 sub extract_no_state {
@@ -312,15 +317,20 @@ sub svc_dep {
 sub abs_path_to_service {
     my ( $target, $base ) = @_;
 
+    # absolute path
     return $1 if $target =~ m{^/(.*)};
 
+    # base can be Verbena::Path instance
     my $bbase = ref($base)? $base->[0]: $base;
-    return reduce { _join_path( $a, $b ); } _dir($bbase), split m{/}, $target;
+    return reduce { _join_path( $a, $b ); } _dir($bbase, 1), split m{/}, $target;
 }
 
 sub _dir {
-    my ($path) = @_;
-    die "No way up" if $path eq '';
+    my ($path, $is_base) = @_;
+    if ($path eq ''){
+        return '' if $is_base;
+        confess "No way up";
+    }
     return $path =~ m{(.*)/} ? $1 : '';
 }
 
