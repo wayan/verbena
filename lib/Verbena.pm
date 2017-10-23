@@ -5,7 +5,7 @@ use common::sense;
 # ABSTRACT: tiny dependency injection container
 
 use List::Util qw(reduce pairmap first pairkeys);
-use Ref::Util qw(is_coderef is_arrayref is_hashref is_refref);
+use Ref::Util qw(is_coderef is_arrayref is_hashref is_refref is_ref);
 use Scalar::Util qw(blessed);
 use Carp qw(confess);
 
@@ -21,12 +21,14 @@ our @EXPORT_OK = qw(
     svc_pos
     svc_named
     svc_defer
+    svc_singleton
     constructor
     svc_dep
     get_service_from
 );
 
 my $MAX_STACK_DEPTH = 20;
+my $MAX_CONTAINER_DEPTH = 20;  # prevents infinite recursion
 
 sub extract {
     my ($container, $target, $opts) = @_;
@@ -51,12 +53,6 @@ sub extract_no_state {
 }
 
 *is_service = \&is_coderef;
-
-sub is_path {
-    my ($candidate) = @_;
-
-    return !ref($candidate) || (blessed($candidate) && $candidate->isa('Verbena::Path'));
-}
 
 sub _extract {
     my ( $container, $path, $target,  $opts, $stack ) = @_;
@@ -113,22 +109,28 @@ sub svc_singleton {
 sub resolve {
     my ( $container, $target, $opts) = @_;
 
-    my $code = _extract($container, $target, $target, $opts, []);
+    my $code = extract($container, $target, $opts, []);
     my ($value, $state) = @{$code->({})};
     return $value;
 }
 
 sub get_service_from {
-    my ($container, $path) = @_;
+    my ($container, $path, $opts) = @_;
 
-    return _get_service_from($container, $path, 0);
+    my $service =  _get_service_from($container, $path, $opts, 0);
+    if (defined($service)){
+        is_service($service) or confess "Invalid service '$service', coderef is expected";
+    }
+    return $service;
 }
 
-my $max_container_depth = 20;  # prevents infinite recursion
 
 sub _get_service_from {
-    my ($container, $path, $depth ) = @_;
+    my ($container, $path, $opts, $depth ) = @_;
 
+    my $max_container_depth = $opts && $opts->{'max_container_depth'} || $MAX_CONTAINER_DEPTH;
+
+    # very unlikely
     $depth < $max_container_depth or confess "Too many levels to find a service";
 
     if (blessed($container )){
@@ -137,9 +139,7 @@ sub _get_service_from {
 
     elsif (is_hashref($container)){
         if (exists( $container->{$path})){
-            my $service = $container->{$path};
-            is_service($service) or confess "Invalid service $service, coderef is expected";
-            return $service;
+            return $container->{$path};
         }
     }
     elsif (is_arrayref($container)){
@@ -152,7 +152,7 @@ sub _get_service_from {
         return _get_mount_service_from($$container, $path, $depth + 1);
     }
     elsif (is_coderef($container)){
-        return get_service_from($container->(), $depth + 1);
+        return _get_service_from($container->(), $path, $depth + 1);
     }
     else {
         confess "Unrecognized type of container";
@@ -301,28 +301,18 @@ sub svc_dep {
         return sub {
             my ( $container, $base, $opts, $stack ) = @_;
             my $path = abs_path_to_service( $target, $base );
-            return _extract( $container, $path, $path, $opts, $stack);
+            return _extract( $container, $path, $path, $opts, $stack );
         };
     }
     elsif ( is_service($target) ) {
         return sub {
             my ( $container, $base, $opts, $stack ) = @_;
-            my $path = [ ref($base) ? @$base : $base, $dep_name // 'anon' ];
-            return _extract( $container, $path, $target, $opts, $stack );
+            return _extract( $container,
+                path_with_dep( $base, $dep_name // 'anon' ),
+                $target, $opts, $stack );
         };
     }
     confess "Unknown type of dependency '$target'";
-}
-
-sub abs_path_to_service {
-    my ( $target, $base ) = @_;
-
-    # absolute path
-    return $1 if $target =~ m{^/(.*)};
-
-    # base can be Verbena::Path instance
-    my $bbase = ref($base)? $base->[0]: $base;
-    return reduce { _join_path( $a, $b ); } _dir($bbase, 1), split m{/}, $target;
 }
 
 sub _dir {
@@ -357,6 +347,41 @@ sub constructor {
     };
 }
 
+# Path handling
+sub is_path {
+    my ($candidate) = @_;
+
+    return !is_ref($candidate) || is_verbena_path($candidate);
+}
+
+sub is_verbena_path {
+    my ($candidate) = @_;
+    return blessed($candidate) && $candidate->isa('Verbena::Path');
+}
+
+sub path_with_dep {
+    my ($base, $dep_name) = @_;
+    return bless([ $base, $dep_name], 'Verbena::Path');
+}
+
+sub path_base {
+    my ($path) = @_;
+    return
+         !is_ref($path)          ? $path
+        : is_verbena_path($path) ? path_base( $path->[0] )
+        :                          confess "Invalid path $path";
+}
+
+sub abs_path_to_service {
+    my ( $target, $base ) = @_;
+
+    # absolute path
+    return $1 if $target =~ m{^/(.*)};
+    return reduce { _join_path( $a, $b ); } _dir( path_base($base), 1 ),
+        split m{/}, $target;
+}
+
+
 {
     package Verbena::Path;
     # path with the dependencies
@@ -365,11 +390,6 @@ sub constructor {
             return shift()->to_string();
         },
         fallback => 1;
-
-    sub new {
-        my ($base, $dep_name) = @_;
-        return bless([ $base, $dep_name], __PACKAGE__);
-    }
 
     sub to_string {
         my $this = shift;
@@ -417,7 +437,7 @@ for example.
 
 =item No syntactic sugar involved.
 
-=item Verbena is only a bunch of function, there is no Moose or other object framework.
+=item Verbena is only a bunch of functions, there is no Moose or other object framework.
 
 =back
 
@@ -475,8 +495,8 @@ Service is an anonymous subroutine which returns a component of your
 application addressed by a path. The service is called with two sets
 of parameters
 
-    my $ret = $service->($container, $path, $stack)->($state);
-    my ($value, $new_state) = @$ret;
+    my $ret = $service->($container, $path, $options, $stack)->($state);
+    my ($value, $new_state) = @{ $ret($state) };
 
 The parameters are:
 
