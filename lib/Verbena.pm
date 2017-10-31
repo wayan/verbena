@@ -27,7 +27,7 @@ our @EXPORT_OK = qw(
     get_service_from
 );
 
-my $MAX_STACK_DEPTH = 20;
+my $MAX_STACK_DEPTH = 100;
 my $MAX_CONTAINER_DEPTH = 20;  # prevents infinite recursion
 
 sub extract {
